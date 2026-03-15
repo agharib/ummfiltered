@@ -273,10 +273,13 @@ def protect_adjacent_words(
 AUDIO_CROSSFADE_MS = 40
 NATURALNESS_WINDOW_MS = 20
 MORPH_BRIDGE_MS = 12
-ANCHOR_SEARCH_MS = 20
+ANCHOR_SEARCH_MS = 40
+TAIL_PRESERVE_MS = 56
+MICRO_BRIDGE_MS = 28
 CHANNEL_GUARD_MARGIN = 0.2
 CHANNEL_GUARD_FACTOR = 1.15
 LOW_ENERGY_THRESHOLD_DB = -38.0
+RISKY_SEAM_THRESHOLD = 1.1
 
 
 @dataclass
@@ -500,6 +503,42 @@ def _apply_boundary_morph_cut(
     return result.astype(np.float32)
 
 
+def _apply_tail_preserving_cut(
+    samples: np.ndarray,
+    cp_sample: int,
+    bridge_samples: int,
+    left_shift: int = 0,
+    right_shift: int = 0,
+) -> np.ndarray:
+    matrix, _ = _as_audio_matrix(samples)
+    result = matrix.copy().astype(np.float64)
+    if bridge_samples < 8:
+        return result.astype(np.float32)
+
+    left_end = max(0, cp_sample - left_shift)
+    right_start = min(len(result), cp_sample + right_shift)
+    left_span = min(bridge_samples, left_end)
+    right_span = min(max(6, bridge_samples // 2), len(result) - right_start)
+    if left_span < 8 or right_span < 6:
+        return result.astype(np.float32)
+
+    target_start = max(0, cp_sample - left_span)
+    target_end = min(len(result), cp_sample + right_span)
+    target_length = target_end - target_start
+    if target_length < 12:
+        return result.astype(np.float32)
+
+    left_window = result[left_end - left_span:left_end]
+    right_window = result[right_start:right_start + right_span]
+    left_seed = _resample_multichannel(left_window, target_length)
+    right_seed = _resample_multichannel(right_window, target_length)
+    positions = np.linspace(0.0, 1.0, target_length, dtype=np.float64)[:, None]
+    fade_in = np.clip(positions ** 2.4, 0.0, 1.0)
+    fade_out = np.sqrt(np.clip(1.0 - fade_in ** 2, 0.0, 1.0))
+    result[target_start:target_end] = left_seed * fade_out + right_seed * fade_in
+    return result.astype(np.float32)
+
+
 def _apply_equal_power_crossfade_cut(
     samples: np.ndarray,
     cp_sample: int,
@@ -531,6 +570,44 @@ def _apply_equal_power_crossfade_cut(
     fade_out = np.cos(theta)
     fade_in = np.sin(theta)
     result[target_start:target_end] = left_seed * fade_out + right_seed * fade_in
+    return result.astype(np.float32)
+
+
+def _apply_micro_bridge_cut(
+    samples: np.ndarray,
+    cp_sample: int,
+    bridge_samples: int,
+    left_shift: int = 0,
+    right_shift: int = 0,
+) -> np.ndarray:
+    matrix, _ = _as_audio_matrix(samples)
+    result = matrix.copy().astype(np.float64)
+    if bridge_samples < 8:
+        return result.astype(np.float32)
+
+    left_end = max(0, cp_sample - left_shift)
+    right_start = min(len(result), cp_sample + right_shift)
+    left_span = min(max(8, bridge_samples + bridge_samples // 2), left_end)
+    right_span = min(max(6, bridge_samples), len(result) - right_start)
+    if left_span < 8 or right_span < 6:
+        return result.astype(np.float32)
+
+    overlap = min(max(6, bridge_samples // 2), left_span, right_span)
+    bridge_left = result[left_end - left_span:left_end]
+    bridge_right = result[right_start:right_start + right_span]
+    overlap_left = bridge_left[-overlap:]
+    overlap_right = bridge_right[:overlap]
+    fade = np.linspace(0.0, 1.0, overlap, dtype=np.float64)[:, None]
+    center = overlap_left * (1.0 - fade) + overlap_right * fade
+    bridge = np.concatenate([bridge_left[:-overlap], center, bridge_right[overlap:]], axis=0)
+
+    target_start = max(0, cp_sample - left_span)
+    target_end = min(len(result), cp_sample + right_span)
+    target_length = target_end - target_start
+    if target_length < 12:
+        return result.astype(np.float32)
+    bridge = _resample_multichannel(bridge, target_length)
+    result[target_start:target_end] = bridge
     return result.astype(np.float32)
 
 
@@ -622,8 +699,9 @@ def _guided_candidate_offsets(
         scored.append((score, offset))
 
     scored.sort(key=lambda item: (item[0], item[1]))
-    prioritized = [offset for _score, offset in scored[:6]]
-    combined = sorted(set([0, limit, *prioritized, *base_offsets[:3]]))
+    prioritized = [offset for _score, offset in scored[:8]]
+    midpoint = limit // 2 if limit > 1 else limit
+    combined = sorted(set([0, midpoint, limit, *prioritized, *base_offsets[:4]]))
     return [offset for offset in combined if offset <= limit]
 
 
@@ -673,6 +751,38 @@ def optimize_audio_seams(
             sample_rate,
             side="right",
         )
+        risky_seam = (
+            raw_eval.downmix.score >= RISKY_SEAM_THRESHOLD
+            or raw_eval.downmix.center_drop_db > 0.65
+            or raw_eval.downmix.spectral_jump > 0.14
+        )
+
+        tail_bridge_samples = min(
+            max(10, int(TAIL_PRESERVE_MS / 1000.0 * sample_rate)),
+            boundary.max_left_blend,
+            max(1, boundary.max_right_blend),
+        )
+        if tail_bridge_samples >= 8:
+            for left_shift in left_offsets:
+                for right_shift in right_offsets:
+                    candidate = _apply_tail_preserving_cut(
+                        result,
+                        cp_sample,
+                        tail_bridge_samples,
+                        left_shift=left_shift,
+                        right_shift=right_shift,
+                    )
+                    candidate_eval = _evaluate_cut(candidate, sample_rate, cp_sample)
+                    if not _candidate_allowed(raw_eval, candidate_eval):
+                        continue
+                    if candidate_eval.downmix.score + 1e-6 < best_eval.downmix.score:
+                        best_audio = candidate
+                        best_eval = candidate_eval
+                        best_strategy = "tail_preserving_bridge"
+                        best_left_shift = left_shift
+                        best_right_shift = right_shift
+                        best_duration_ms = float(TAIL_PRESERVE_MS)
+                        best_notes = "tail_preserving"
 
         crossfade_found = False
         for crossfade_ms in crossfade_options_ms:
@@ -704,6 +814,34 @@ def optimize_audio_seams(
                         best_duration_ms = float(crossfade_ms)
                         best_notes = ""
                         crossfade_found = True
+
+        if risky_seam and not boundary.allow_room_tone:
+            micro_bridge_samples = min(
+                max(8, int(MICRO_BRIDGE_MS / 1000.0 * sample_rate)),
+                boundary.max_left_blend,
+                boundary.max_right_blend,
+            )
+            if micro_bridge_samples >= 8:
+                for left_shift in left_offsets:
+                    for right_shift in right_offsets:
+                        candidate = _apply_micro_bridge_cut(
+                            result,
+                            cp_sample,
+                            micro_bridge_samples,
+                            left_shift=left_shift,
+                            right_shift=right_shift,
+                        )
+                        candidate_eval = _evaluate_cut(candidate, sample_rate, cp_sample)
+                        if not _candidate_allowed(raw_eval, candidate_eval):
+                            continue
+                        if candidate_eval.downmix.score + 1e-6 < best_eval.downmix.score:
+                            best_audio = candidate
+                            best_eval = candidate_eval
+                            best_strategy = "micro_bridge"
+                            best_left_shift = left_shift
+                            best_right_shift = right_shift
+                            best_duration_ms = float(MICRO_BRIDGE_MS)
+                            best_notes = "risky_speech_seam"
 
         if boundary.allow_room_tone:
             cf_samples = min(

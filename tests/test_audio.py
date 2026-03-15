@@ -240,3 +240,52 @@ class TestAssembleAudioTrack:
         np.testing.assert_allclose(assembled, expected)
         assert report.entries
         assert report.entries[0].chosen_strategy == "raw"
+
+    def test_prefers_smoother_transition_strategy_when_padding_exists(self):
+        sample_rate = 1000
+        t = np.linspace(0, 0.2, 200, endpoint=False, dtype=np.float32)
+        left = np.stack(
+            [
+                0.45 * np.sin(2 * np.pi * 8 * t),
+                0.35 * np.sin(2 * np.pi * 8 * t),
+            ],
+            axis=1,
+        )
+        right = np.stack(
+            [
+                0.45 * np.sin(2 * np.pi * 8 * t + np.pi / 2),
+                0.35 * np.sin(2 * np.pi * 8 * t + np.pi / 2),
+            ],
+            axis=1,
+        )
+        source_audio = np.concatenate([left, np.zeros((40, 2), dtype=np.float32), right], axis=0)
+
+        segments = [
+            Segment(0.0, 0.2, TransitionType.HARD, 1.0),
+            Segment(0.24, 0.44, TransitionType.HARD, 1.0),
+        ]
+        preserved_words = [
+            Word("left", 0.0, 0.12, 0.99),
+            Word("right", 0.32, 0.44, 0.99),
+        ]
+        edit_plan = build_edit_decision_list(segments, preserved_words=preserved_words)
+
+        assembled, report = assemble_audio_track(
+            source_audio=source_audio,
+            sample_rate=sample_rate,
+            edit_plan=edit_plan,
+            room_tone=np.zeros((20, 2), dtype=np.float32),
+        )
+
+        cut_point = report.entries[0].output_time
+        baseline = np.concatenate([source_audio[:200], source_audio[240:440]], axis=0)
+        baseline_score = measure_cut_naturalness(baseline, sample_rate, cut_point).score
+        improved_score = measure_cut_naturalness(assembled, sample_rate, cut_point).score
+
+        assert report.entries[0].chosen_strategy in {
+            "tail_preserving_bridge",
+            "micro_bridge",
+            "equal_power_crossfade",
+            "boundary_morph",
+        }
+        assert improved_score < baseline_score
