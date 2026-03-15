@@ -45,22 +45,22 @@ export const PRESETS: Record<
   }
 > = {
   speed: {
-    label: "Speed",
-    tagline: "Fastest local pass for drafts and quick social clips.",
+    label: "Conservative",
+    tagline: "Fastest pass with gentler cleanup.",
     modelSize: "base",
     quality: "matched",
     verifyPass: false,
   },
   balanced: {
-    label: "Balanced",
-    tagline: "The default sweet spot for everyday clean-up.",
+    label: "Natural Cleanup",
+    tagline: "Default cleanup for everyday talking-head edits.",
     modelSize: "medium",
     quality: "matched",
     verifyPass: true,
   },
   quality: {
-    label: "Quality",
-    tagline: "Highest transcription confidence and cleaner export settings.",
+    label: "High Precision",
+    tagline: "Most thorough local pass for difficult audio.",
     modelSize: "large",
     quality: "lossless",
     verifyPass: true,
