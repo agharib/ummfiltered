@@ -1,5 +1,7 @@
 import numpy as np
-from ummfiltered.cut_planner import build_keep_segments, compute_frame_similarity
+from unittest.mock import patch
+
+from ummfiltered.cut_planner import build_keep_segments, classify_transitions, compute_frame_similarity
 from ummfiltered.models import DetectionSource, FillerSegment, Segment, TransitionType, Word
 
 
@@ -62,3 +64,29 @@ class TestFrameSimilarity:
         frame_b = np.full((100, 100, 3), 255, dtype=np.uint8)
         score = compute_frame_similarity(frame_a, frame_b)
         assert score < 0.1
+
+
+class TestClassifyTransitions:
+    def test_only_moves_boundaries_deeper_into_kept_segments(self):
+        segments = [
+            Segment(0.0, 5.0, TransitionType.HARD, 1.0),
+            Segment(6.0, 10.0, TransitionType.HARD, 1.0),
+        ]
+
+        def get_frame_at(time_s: float) -> np.ndarray:
+            return np.array([[[time_s]]], dtype=np.float32)
+
+        with patch(
+            "ummfiltered.cut_planner.compute_frame_similarity",
+            side_effect=lambda a, b: float(b[0, 0, 0] - a[0, 0, 0]),
+        ):
+            classified = classify_transitions(
+                segments,
+                get_frame_at,
+                ssim_threshold=10.0,
+                search_window=2,
+                framerate=10.0,
+            )
+
+        assert classified[0].end < 5.0
+        assert classified[1].start > 6.0

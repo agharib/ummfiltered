@@ -17,10 +17,12 @@ Remove filler words from talking-head videos. Takes a video, detects "um", "uh",
 
 **System requirements:**
 - Python 3.10+
-- ffmpeg (auto-installed on first run if missing, or install manually via `brew install ffmpeg` / `apt install ffmpeg`)
+- ffmpeg and ffprobe
+
+If they are not already installed, ummfiltered will provision bundled versions automatically on first run.
 
 ```bash
-git clone git@git.corp.stripe.com:ahmedg/UmmFiltered.git
+git clone https://github.com/agharib/ummfiltered.git
 cd UmmFiltered
 pip install -e .
 ```
@@ -57,7 +59,7 @@ python -m ummfiltered.cli my_video.mp4
 |---|---|---|
 | `input` | — | Input video file (required) |
 | `-o`, `--output` | `{name}_ummfiltered.{ext}` | Output file path |
-| `--model-size` | `medium` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large`. Larger = more accurate but slower. |
+| `--model-size` | `large` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large`. Larger = more accurate but slower. |
 | `--cloud` | — | Use a cloud API instead of local Whisper. Options: `deepgram` |
 | `--aggressive` | off | Also detect contextual fillers like "like", "so", "basically" (words that are only sometimes fillers) |
 | `--interactive` | off | Step through each detected filler and confirm before removing |

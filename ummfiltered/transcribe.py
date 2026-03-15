@@ -26,7 +26,7 @@ def build_whisper_params(model_size: str) -> dict:
     }
 
 
-def transcribe_local(audio_path: str | Path, model_size: str = "medium") -> list[Word]:
+def transcribe_local(audio_path: str | Path, model_size: str = "large") -> list[Word]:
     if WhisperModel is None:
         raise ImportError("faster-whisper is required for local transcription")
 
@@ -78,7 +78,7 @@ def transcribe_cloud_deepgram(audio_path: str | Path) -> list[Word]:
     return words
 
 
-def transcribe(audio_path: str | Path, model_size: str = "medium", cloud: str | None = None) -> list[Word]:
+def transcribe(audio_path: str | Path, model_size: str = "large", cloud: str | None = None) -> list[Word]:
     if cloud == "deepgram":
         return transcribe_cloud_deepgram(audio_path)
     return transcribe_local(audio_path, model_size)

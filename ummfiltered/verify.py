@@ -3,7 +3,15 @@ from pathlib import Path
 import numpy as np
 
 from ummfiltered.audio import compute_rms_db, extract_audio_pcm, find_silence_boundaries, protect_adjacent_words
-from ummfiltered.config import FILLER_MARGIN_END_MS, FILLER_MARGIN_START_MS, MAX_EXPANSION_MS, SILENCE_THRESHOLD_DB
+from ummfiltered.config import (
+    CROSSFADE_MS,
+    FILLER_MARGIN_END_MS,
+    FILLER_MARGIN_START_MS,
+    MAX_EXPANSION_MS,
+    PHRASE_MARGIN_END_BONUS_MS,
+    PHRASE_MARGIN_START_BONUS_MS,
+    SILENCE_THRESHOLD_DB,
+)
 from ummfiltered.detect import detect_fillers, filter_fillers_by_context
 from ummfiltered.models import (
     CutAdjustment, FillerSegment, Segment, VerificationResult, Word,
@@ -14,26 +22,31 @@ from ummfiltered.transcribe import transcribe
 SegmentMap = list[tuple[float, float, float]]
 
 
-def build_segment_map(segments: list[Segment]) -> SegmentMap:
+def build_segment_map(
+    segments: list[Segment],
+    pause_overrides: dict[int, float] | None = None,
+    transition_durations: dict[int, float] | None = None,
+) -> SegmentMap:
     seg_map: SegmentMap = []
     output_offset = 0.0
-    for seg in segments:
+    for i, seg in enumerate(segments):
         seg_map.append((seg.start, seg.end, output_offset))
         output_offset += seg.end - seg.start
+        output_offset += pause_overrides.get(i, 0.0) if pause_overrides else 0.0
+        output_offset += transition_durations.get(i + 1, 0.0) if transition_durations else 0.0
     return seg_map
 
 
 def map_output_to_original(output_time: float, seg_map: SegmentMap) -> float:
     for i, (orig_start, orig_end, out_offset) in enumerate(seg_map):
         seg_duration = orig_end - orig_start
+        out_end = out_offset + seg_duration
+        if output_time < out_offset:
+            return orig_start
         is_last = i == len(seg_map) - 1
-        if is_last:
-            if output_time <= out_offset + seg_duration:
-                return orig_start + (output_time - out_offset)
-        else:
-            if output_time < out_offset + seg_duration:
-                return orig_start + (output_time - out_offset)
-    last_orig_start, last_orig_end, last_out_offset = seg_map[-1]
+        if output_time < out_end or (is_last and output_time <= out_end):
+            return orig_start + (output_time - out_offset)
+    _last_orig_start, last_orig_end, _last_out_offset = seg_map[-1]
     return last_orig_end
 
 
@@ -50,14 +63,37 @@ def _is_near_known_filler(
     return False
 
 
+def _remap_filler_to_original(
+    output_filler: FillerSegment,
+    seg_map: SegmentMap,
+) -> FillerSegment:
+    original_start = map_output_to_original(output_filler.start, seg_map)
+    original_end = map_output_to_original(output_filler.end, seg_map)
+    if original_end < original_start:
+        original_end = original_start
+    return FillerSegment(
+        start=original_start,
+        end=original_end,
+        word=output_filler.word,
+        confidence=output_filler.confidence,
+        source=output_filler.source,
+    )
+
+
 def check_remaining_fillers(
     output_words: list[Word],
     original_fillers: list[FillerSegment],
     segments: list[Segment],
     aggressive: bool = False,
     min_confidence: float = 0.15,
+    pause_overrides: dict[int, float] | None = None,
+    transition_durations: dict[int, float] | None = None,
 ) -> tuple[list[FillerSegment], list[FillerSegment]]:
-    seg_map = build_segment_map(segments)
+    seg_map = build_segment_map(
+        segments,
+        pause_overrides=pause_overrides,
+        transition_durations=transition_durations,
+    )
     detected = detect_fillers(output_words, aggressive=aggressive)
     detected = filter_fillers_by_context(detected, output_words, min_confidence=min_confidence)
 
@@ -65,10 +101,11 @@ def check_remaining_fillers(
     new: list[FillerSegment] = []
 
     for f in detected:
+        original_filler = _remap_filler_to_original(f, seg_map)
         if _is_near_known_filler(f, original_fillers, seg_map):
-            remaining.append(f)
+            remaining.append(original_filler)
         else:
-            new.append(f)
+            new.append(original_filler)
 
     return remaining, new
 
@@ -137,6 +174,8 @@ def check_word_integrity(
     output_words: list[Word],
     cut_fillers: list[FillerSegment],
     segments: list[Segment],
+    pause_overrides: dict[int, float] | None = None,
+    transition_durations: dict[int, float] | None = None,
 ) -> tuple[list[Word], list[tuple[Word, int]]]:
     expected = _build_expected_words(original_words, cut_fillers)
     expected_texts = [w.text for w in expected]
@@ -148,13 +187,22 @@ def check_word_integrity(
         if i not in matched and _is_near_cut(expected[i], cut_fillers)
     ]
 
-    seg_map = build_segment_map(segments)
+    seg_map = build_segment_map(
+        segments,
+        pause_overrides=pause_overrides,
+        transition_durations=transition_durations,
+    )
     cut_boundaries: list[float] = []
     output_offset = 0.0
     for i, seg in enumerate(segments):
-        if i > 0:
-            cut_boundaries.append(output_offset)
         output_offset += seg.end - seg.start
+        output_offset += pause_overrides.get(i, 0.0) if pause_overrides else 0.0
+        if i < len(segments) - 1:
+            cut_boundaries.append(output_offset)
+            transition_duration = transition_durations.get(i + 1, 0.0) if transition_durations else 0.0
+            if transition_duration > 0:
+                output_offset += transition_duration
+                cut_boundaries.append(output_offset)
 
     damaged: list[tuple[Word, int]] = []
     for ow in output_words:
@@ -234,28 +282,37 @@ def verify_output(
     original_words: list[Word],
     original_fillers: list[FillerSegment],
     segments: list[Segment],
-    model_size: str = "medium",
+    model_size: str = "large",
     aggressive: bool = False,
     min_confidence: float = 0.15,
+    pause_overrides: dict[int, float] | None = None,
+    transition_durations: dict[int, float] | None = None,
 ) -> VerificationResult:
     output_words = transcribe(str(output_path), model_size=model_size)
 
     remaining, new = check_remaining_fillers(
         output_words, original_fillers, segments,
-        aggressive=aggressive, min_confidence=min_confidence,
+        aggressive=aggressive,
+        min_confidence=min_confidence,
+        pause_overrides=pause_overrides,
+        transition_durations=transition_durations,
     )
 
     lost, damaged = check_word_integrity(
-        original_words, output_words, original_fillers, segments,
+        original_words,
+        output_words,
+        original_fillers,
+        segments,
+        pause_overrides=pause_overrides,
+        transition_durations=transition_durations,
     )
 
     samples, sample_rate = extract_audio_pcm(output_path)
-    cut_points: list[float] = []
-    output_offset = 0.0
-    for i, seg in enumerate(segments):
-        if i > 0:
-            cut_points.append(output_offset)
-        output_offset += seg.end - seg.start
+    cut_points = list(_build_cut_points(
+        segments,
+        pause_overrides=pause_overrides,
+        transition_durations=transition_durations,
+    ).values())
 
     audio_discs = check_audio_smoothness(samples, sample_rate, cut_points)
 
@@ -273,16 +330,131 @@ EXPANSION_DECREMENT_MS = 100.0
 CROSSFADE_INCREMENT_MS = 40.0
 
 
+def _expansion_increment_for_filler(filler: FillerSegment) -> float:
+    increment = EXPANSION_INCREMENT_MS
+    if " " in filler.word:
+        increment += 100.0
+    return increment
+
+
+def _filler_margin_seconds(filler: FillerSegment) -> tuple[float, float]:
+    start_ms = FILLER_MARGIN_START_MS
+    end_ms = FILLER_MARGIN_END_MS
+    if " " in filler.word:
+        start_ms += PHRASE_MARGIN_START_BONUS_MS
+        end_ms += PHRASE_MARGIN_END_BONUS_MS
+    return start_ms / 1000.0, end_ms / 1000.0
+
+
 def apply_adjustments(
     adjustments: dict[int, CutAdjustment],
     result: VerificationResult,
     segments: list[Segment] | None = None,
+    pause_overrides: dict[int, float] | None = None,
+    transition_durations: dict[int, float] | None = None,
 ) -> None:
-    for dw, cut_idx in result.damaged_words:
-        if cut_idx < len(adjustments):
-            adjustments[cut_idx].expansion_ms = max(
-                100.0, adjustments[cut_idx].expansion_ms - EXPANSION_DECREMENT_MS
+    prioritized_keys: set[int] = set()
+    for filler in result.remaining_fillers:
+        match_key = _find_adjustment_for_filler(adjustments, filler)
+        if match_key is not None:
+            prioritized_keys.add(match_key)
+            adjustments[match_key].filler = FillerSegment(
+                start=min(adjustments[match_key].filler.start, filler.start),
+                end=max(adjustments[match_key].filler.end, filler.end),
+                word=adjustments[match_key].filler.word,
+                confidence=max(adjustments[match_key].filler.confidence, filler.confidence),
+                source=adjustments[match_key].filler.source,
             )
+            adjustments[match_key].expansion_ms += _expansion_increment_for_filler(filler)
+
+    for filler in result.new_fillers:
+        next_key = max(adjustments.keys(), default=-1) + 1
+        adjustments[next_key] = CutAdjustment(
+            filler=filler,
+            expansion_ms=MAX_EXPANSION_MS,
+            crossfade_ms=CROSSFADE_MS,
+        )
+
+    for dw, cut_idx in result.damaged_words:
+        adjustment_key = _adjustment_key_for_cut_index(adjustments, cut_idx)
+        if adjustment_key is not None:
+            if adjustment_key in prioritized_keys:
+                continue
+            adjustments[adjustment_key].expansion_ms = max(
+                100.0, adjustments[adjustment_key].expansion_ms - EXPANSION_DECREMENT_MS
+            )
+
+    if segments:
+        cut_points = _build_cut_points(
+            segments,
+            pause_overrides=pause_overrides,
+            transition_durations=transition_durations,
+        )
+        for cut_time, _severity in result.audio_discontinuities:
+            cut_idx = _find_cut_index(cut_points, cut_time)
+            adjustment_key = _adjustment_key_for_cut_index(adjustments, cut_idx)
+            if adjustment_key is not None:
+                adjustments[adjustment_key].crossfade_ms += CROSSFADE_INCREMENT_MS
+
+
+def _find_adjustment_for_filler(
+    adjustments: dict[int, CutAdjustment],
+    filler: FillerSegment,
+) -> int | None:
+    candidates = [
+        (
+            abs(adj.filler.start - filler.start) + abs(adj.filler.end - filler.end),
+            key,
+        )
+        for key, adj in adjustments.items()
+        if adj.filler.word == filler.word
+    ]
+    if not candidates:
+        return None
+    return min(candidates)[1]
+
+
+def _ordered_adjustment_keys(adjustments: dict[int, CutAdjustment]) -> list[int]:
+    return [
+        key for key, adjustment in sorted(
+            adjustments.items(),
+            key=lambda item: (item[1].filler.start, item[1].filler.end, item[0]),
+        )
+        if not adjustment.skip
+    ]
+
+
+def _adjustment_key_for_cut_index(
+    adjustments: dict[int, CutAdjustment],
+    cut_idx: int | None,
+) -> int | None:
+    if cut_idx is None:
+        return None
+    ordered_keys = _ordered_adjustment_keys(adjustments)
+    if cut_idx < 0 or cut_idx >= len(ordered_keys):
+        return None
+    return ordered_keys[cut_idx]
+
+def _build_cut_points(
+    segments: list[Segment],
+    pause_overrides: dict[int, float] | None = None,
+    transition_durations: dict[int, float] | None = None,
+) -> dict[int, float]:
+    cut_points: dict[int, float] = {}
+    output_offset = 0.0
+    for i, seg in enumerate(segments):
+        output_offset += seg.end - seg.start
+        output_offset += pause_overrides.get(i, 0.0) if pause_overrides else 0.0
+        if i < len(segments) - 1:
+            cut_points[i] = output_offset
+            output_offset += transition_durations.get(i + 1, 0.0) if transition_durations else 0.0
+    return cut_points
+
+
+def _find_cut_index(cut_points: dict[int, float], cut_time: float) -> int | None:
+    if not cut_points:
+        return None
+    return min(cut_points, key=lambda idx: abs(cut_points[idx] - cut_time))
 
 
 
@@ -298,9 +470,11 @@ def rebuild_cuts(
     crossfade_map: dict[int, float] = {}
 
     audio_duration = len(samples) / sample_rate
-    margin_start_s = FILLER_MARGIN_START_MS / 1000.0
-    margin_end_s = FILLER_MARGIN_END_MS / 1000.0
-    for idx, adj in sorted(active.items()):
+    for idx, adj in sorted(
+        active.items(),
+        key=lambda item: (item[1].filler.start, item[1].filler.end, item[0]),
+    ):
+        margin_start_s, margin_end_s = _filler_margin_seconds(adj.filler)
         filler_start = max(0.0, min(adj.filler.start - margin_start_s, audio_duration))
         filler_end = max(filler_start, min(adj.filler.end + margin_end_s, audio_duration))
         if filler_start >= filler_end:
@@ -322,6 +496,9 @@ def rebuild_cuts(
             word=adj.filler.word, confidence=adj.filler.confidence,
             source=adj.filler.source,
         ))
-        crossfade_map[len(expanded_fillers) - 1] = adj.crossfade_ms
+        seg_idx = len(expanded_fillers) - 1
+        crossfade_s = adj.crossfade_ms / 1000.0
+        crossfade_map[seg_idx] = max(crossfade_map.get(seg_idx, 0.0), crossfade_s)
+        crossfade_map[seg_idx + 1] = max(crossfade_map.get(seg_idx + 1, 0.0), crossfade_s)
 
     return expanded_fillers, crossfade_map

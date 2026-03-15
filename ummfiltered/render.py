@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from ummfiltered.config import CROSSFADE_MS, PADDING_MS
 from ummfiltered.models import Segment, TransitionType, VideoMetadata
@@ -100,15 +101,15 @@ def _extract_segments(
     pause_ms: float = 0,
     crossfade_overrides: dict[int, float] | None = None,
     pause_overrides: dict[int, float] | None = None,
-) -> list[Path]:
+) -> list[tuple[int, Path]]:
     pause_s = pause_ms / 1000.0
-    seg_files = []
+    seg_files: list[tuple[int, Path]] = []
     for i, seg in enumerate(padded):
         duration = seg.end - seg.start
         if duration < 0.001:
             continue
-        seg_path = Path(tmpdir) / f"seg_{i:04d}.ts"
-        seg_files.append(seg_path)
+        seg_path = Path(tmpdir) / f"seg_{i:04d}.mp4"
+        seg_files.append((i, seg_path))
 
         vf_filters = []
         af_filters = []
@@ -122,11 +123,24 @@ def _extract_segments(
             vf_filters.append(f"tpad=stop_duration={seg_pause_s}:stop_mode=clone")
             af_filters.append(f"apad=pad_dur={seg_pause_s}")
 
+        video_filter = ",".join([
+            f"trim=start={seg.start:.4f}:duration={duration:.4f}",
+            "setpts=PTS-STARTPTS",
+            *vf_filters,
+        ])
+        audio_filter = ",".join([
+            f"atrim=start={seg.start:.4f}:duration={duration:.4f}",
+            "asetpts=PTS-STARTPTS",
+            *af_filters,
+        ])
+
         cmd = [
             "ffmpeg", "-y",
-            "-ss", f"{seg.start:.4f}",
-            "-t", f"{duration:.4f}",
             "-i", str(input_path),
+            "-filter_complex",
+            f"[0:v]{video_filter}[v];[0:a]{audio_filter}[a]",
+            "-map", "[v]",
+            "-map", "[a]",
             "-c:v", "libx264", "-preset", "fast",
             "-c:a", "aac",
             "-ar", str(metadata.audio_sample_rate),
@@ -134,9 +148,6 @@ def _extract_segments(
             "-pix_fmt", metadata.pixel_format,
             "-r", str(metadata.framerate),
         ]
-        if vf_filters:
-            cmd.extend(["-vf", ",".join(vf_filters)])
-        cmd.extend(["-af", ",".join(af_filters)])
         cmd.append(str(seg_path))
         subprocess.run(cmd, capture_output=True, check=True)
     return seg_files
@@ -156,6 +167,47 @@ def _render_concat(seg_files: list[Path], output_path: Path, metadata: VideoMeta
     _add_encoding_args(cmd, metadata, quality)
     cmd.append(str(output_path))
     subprocess.run(cmd, capture_output=True, check=True)
+
+
+def _audio_channel_layout(audio_channels: int) -> str:
+    if audio_channels == 1:
+        return "mono"
+    if audio_channels == 2:
+        return "stereo"
+    return "stereo"
+
+
+def _render_interpolation_clip(
+    frames: list[np.ndarray],
+    metadata: VideoMetadata,
+    tmpdir: str,
+    clip_idx: int,
+) -> Path:
+    frame_dir = Path(tmpdir) / f"interp_{clip_idx:04d}"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    for frame_idx, frame in enumerate(frames):
+        Image.fromarray(frame).save(frame_dir / f"{frame_idx:04d}.png")
+
+    clip_path = Path(tmpdir) / f"interp_{clip_idx:04d}.mp4"
+    duration_s = len(frames) / metadata.framerate
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(metadata.framerate),
+        "-i", str(frame_dir / "%04d.png"),
+        "-f", "lavfi",
+        "-i", f"anullsrc=r={metadata.audio_sample_rate}:cl={_audio_channel_layout(metadata.audio_channels)}",
+        "-t", f"{duration_s:.4f}",
+        "-c:v", "libx264", "-preset", "fast",
+        "-c:a", "aac",
+        "-ar", str(metadata.audio_sample_rate),
+        "-ac", str(metadata.audio_channels),
+        "-pix_fmt", metadata.pixel_format,
+        "-r", str(metadata.framerate),
+        str(clip_path),
+    ]
+    subprocess.run(cmd, capture_output=True, check=True)
+    return clip_path
 
 
 def render_video(
@@ -191,7 +243,13 @@ def render_video(
             crossfade_overrides=crossfade_overrides,
             pause_overrides=pause_overrides,
         )
-        _render_concat(seg_files, output_path, metadata, quality, tmpdir)
+        ordered_files: list[Path] = []
+        for seg_idx, seg_path in seg_files:
+            ordered_files.append(seg_path)
+            frames = interpolated_frames.get(seg_idx + 1) if interpolated_frames else None
+            if frames:
+                ordered_files.append(_render_interpolation_clip(frames, metadata, tmpdir, seg_idx + 1))
+        _render_concat(ordered_files, output_path, metadata, quality, tmpdir)
 
 
 def replace_audio_track(
@@ -204,9 +262,16 @@ def replace_audio_track(
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         wav_path = f.name
 
-    audio_int16 = (np.clip(audio_samples, -1.0, 1.0) * 32767).astype(np.int16)
+    channel_count = max(1, metadata.audio_channels)
+    mono_audio = np.clip(audio_samples, -1.0, 1.0)
+    if channel_count == 1:
+        audio_matrix = mono_audio[:, None]
+    else:
+        audio_matrix = np.repeat(mono_audio[:, None], channel_count, axis=1)
+
+    audio_int16 = (audio_matrix * 32767).astype(np.int16)
     with wave.open(wav_path, "wb") as wf:
-        wf.setnchannels(1)
+        wf.setnchannels(channel_count)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(audio_int16.tobytes())

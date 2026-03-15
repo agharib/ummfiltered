@@ -16,10 +16,12 @@ MIN_PAUSE_GAP_MS = 300
 MAX_FILLER_DURATION_MS = 500
 SSIM_THRESHOLD = 0.85
 FRAME_SEARCH_WINDOW = 5
-CROSSFADE_MS = 15
+CROSSFADE_MS = 40
 PADDING_MS = 0
 FILLER_MARGIN_START_MS = 50
 FILLER_MARGIN_END_MS = 150
+PHRASE_MARGIN_START_BONUS_MS = 40
+PHRASE_MARGIN_END_BONUS_MS = 80
 MIN_CONFIDENCE = 0.15
 INTERPOLATION_FRAMES = 3
 
@@ -28,4 +30,3 @@ WHISPER_FILLER_PROMPT = "Um, uh, so like, you know, basically, I mean, er, ah, h
 
 def compute_adaptive_pause(filler_duration_s: float) -> float:
     return max(0.0, filler_duration_s * 0.3 - 0.05)
-

@@ -74,19 +74,24 @@ def classify_transitions(
 
         best_score = score
         frame_duration = 1.0 / framerate
+        best_prev_end = prev_end_time
+        best_curr_start = curr_start_time
         for offset in range(1, search_window + 1):
-            for da, db in [(offset, 0), (0, -offset), (offset, -offset)]:
-                t_a = prev_end_time + da * frame_duration
-                t_b = curr_start_time + db * frame_duration
-                if t_a > curr_start_time or t_b < prev_end_time:
+            for da, db in [(offset, 0), (0, offset), (offset, offset)]:
+                t_a = max(segments[i - 1].start, prev_end_time - da * frame_duration)
+                t_b = min(segments[i].end, curr_start_time + db * frame_duration)
+                if t_a >= prev_end_time or t_b <= curr_start_time:
                     continue
                 fa = get_frame_at(t_a)
                 fb = get_frame_at(t_b)
                 s = compute_frame_similarity(fa, fb)
                 if s > best_score:
                     best_score = s
-                    segments[i - 1].end = t_a
-                    segments[i].start = t_b
+                    best_prev_end = t_a
+                    best_curr_start = t_b
+
+        segments[i - 1].end = best_prev_end
+        segments[i].start = best_curr_start
 
         if best_score >= ssim_threshold:
             segments[i].transition_type = TransitionType.HARD

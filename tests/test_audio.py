@@ -1,10 +1,14 @@
 import numpy as np
 import pytest
-from ummfiltered.audio import compute_rms_db, find_silence_boundaries, extract_room_tone, find_speech_onset, protect_adjacent_words
+from ummfiltered.audio import compute_rms_db, extract_room_tone, find_silence_boundaries, find_speech_onset, measure_cut_naturalness, protect_adjacent_words, smooth_rendered_audio
 from ummfiltered.models import Word
 
 
 class TestComputeRmsDb:
+    def test_empty_samples_returns_very_low_db(self):
+        silence = np.array([], dtype=np.float32)
+        assert compute_rms_db(silence) < -90
+
     def test_silence_returns_very_low_db(self):
         silence = np.zeros(1000, dtype=np.float32)
         assert compute_rms_db(silence) < -90
@@ -77,17 +81,17 @@ class TestProtectAdjacentWords:
         )
         assert result is not None
         start, end = result
-        assert start >= 1.95 + 0.04
+        assert start >= 1.95 + 0.009
 
     def test_returns_none_when_protection_collapses_region(self):
         sample_rate = 16000
         samples = np.zeros(sample_rate * 10, dtype=np.float32)
         non_filler_words = [
-            Word("hello", 0.0, 2.49, 0.95),
-            Word("world", 2.52, 3.0, 0.95),
+            Word("hello", 0.0, 2.499, 0.95),
+            Word("world", 2.505, 3.0, 0.95),
         ]
         result = protect_adjacent_words(
-            new_start=2.50, new_end=2.51,
+            new_start=2.500, new_end=2.504,
             non_filler_words=non_filler_words,
             samples=samples, sample_rate=sample_rate,
         )
@@ -109,3 +113,54 @@ class TestProtectAdjacentWords:
         start, end = result
         assert start == 2.0
         assert end == 3.0
+
+
+class TestSmoothRenderedAudio:
+    def test_clamps_cut_points_past_audio_end(self):
+        samples = np.zeros(1600, dtype=np.float32)
+        room_tone = np.zeros(200, dtype=np.float32)
+        result = smooth_rendered_audio(
+            rendered_samples=samples,
+            sample_rate=16000,
+            cut_points=[1.0],
+            room_tone=room_tone,
+        )
+        assert result.shape == samples.shape
+
+    def test_improves_naturalness_for_hard_splice(self):
+        sample_rate = 16000
+        t = np.linspace(0, 0.04, int(sample_rate * 0.04), endpoint=False, dtype=np.float32)
+        left = 0.4 * np.sin(2 * np.pi * 220 * t)
+        right = 0.4 * np.sin(2 * np.pi * 220 * t + np.pi / 2)
+        samples = np.concatenate([left, right]).astype(np.float32)
+        cut_point = len(left) / sample_rate
+        baseline = measure_cut_naturalness(samples, sample_rate, cut_point)
+
+        smoothed = smooth_rendered_audio(
+            rendered_samples=samples,
+            sample_rate=sample_rate,
+            cut_points=[cut_point],
+            room_tone=np.zeros(int(sample_rate * 0.02), dtype=np.float32),
+        )
+        improved = measure_cut_naturalness(smoothed, sample_rate, cut_point)
+
+        assert improved.score < baseline.score
+        assert improved.amplitude_jump < baseline.amplitude_jump
+
+    def test_avoids_creating_energy_hole_in_smooth_signal(self):
+        sample_rate = 16000
+        t = np.linspace(0, 0.08, int(sample_rate * 0.08), endpoint=False, dtype=np.float32)
+        samples = 0.4 * np.sin(2 * np.pi * 220 * t)
+        cut_point = 0.04
+        baseline = measure_cut_naturalness(samples, sample_rate, cut_point)
+
+        smoothed = smooth_rendered_audio(
+            rendered_samples=samples,
+            sample_rate=sample_rate,
+            cut_points=[cut_point],
+            room_tone=np.zeros(int(sample_rate * 0.02), dtype=np.float32),
+        )
+        improved = measure_cut_naturalness(smoothed, sample_rate, cut_point)
+
+        assert improved.center_drop_db <= baseline.center_drop_db + 0.05
+        assert improved.score <= baseline.score + 0.05

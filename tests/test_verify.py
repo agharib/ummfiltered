@@ -103,6 +103,51 @@ class TestCheckRemainingFillers:
         assert len(new) == 1
         assert new[0].word == "uh"
 
+    def test_remaining_filler_is_remapped_to_original_timeline(self):
+        original_fillers = [
+            FillerSegment(5.4, 5.6, "um", 0.4, DetectionSource.DICTIONARY),
+        ]
+        segments = [
+            Segment(0.0, 2.0, TransitionType.HARD, 1.0),
+            Segment(3.0, 4.0, TransitionType.HARD, 1.0),
+            Segment(5.2, 8.0, TransitionType.HARD, 1.0),
+        ]
+        output_words = [
+            Word("hello", 0.0, 0.5, 0.95),
+            Word("um", 3.2, 3.4, 0.6),
+            Word("world", 3.5, 4.0, 0.92),
+        ]
+        remaining, new = check_remaining_fillers(
+            output_words, original_fillers, segments,
+            aggressive=False, min_confidence=0.15,
+        )
+        assert len(remaining) == 1
+        assert len(new) == 0
+        assert remaining[0].start == 5.4
+        assert remaining[0].end == 5.6
+
+    def test_new_filler_is_remapped_to_original_timeline(self):
+        original_fillers = [
+            FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY),
+        ]
+        segments = [
+            Segment(0.0, 2.0, TransitionType.HARD, 1.0),
+            Segment(3.0, 8.0, TransitionType.HARD, 1.0),
+        ]
+        output_words = [
+            Word("hello", 0.0, 0.5, 0.95),
+            Word("uh", 2.2, 2.5, 0.6),
+            Word("world", 2.6, 3.0, 0.92),
+        ]
+        remaining, new = check_remaining_fillers(
+            output_words, original_fillers, segments,
+            aggressive=False, min_confidence=0.15,
+        )
+        assert len(remaining) == 0
+        assert len(new) == 1
+        assert new[0].start == 3.2
+        assert new[0].end == 3.5
+
     def test_no_issues(self):
         original_fillers = [
             FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY),
@@ -281,6 +326,28 @@ class TestApplyAdjustments:
         apply_adjustments(adjustments, result)
         assert adjustments[0].expansion_ms == 450.0
 
+    def test_extends_remaining_filler_window_to_cover_surviving_span(self):
+        original = FillerSegment(5.0, 5.2, "um", 0.4, DetectionSource.DICTIONARY)
+        surviving = FillerSegment(4.9, 5.4, "um", 0.7, DetectionSource.DICTIONARY)
+        adjustments = {0: CutAdjustment(filler=original, expansion_ms=300.0, crossfade_ms=40.0)}
+        result = VerificationResult(
+            remaining_fillers=[surviving], new_fillers=[], lost_words=[],
+            damaged_words=[], audio_discontinuities=[],
+        )
+        apply_adjustments(adjustments, result)
+        assert adjustments[0].filler.start == 4.9
+        assert adjustments[0].filler.end == 5.4
+
+    def test_phrase_fillers_widen_more_aggressively(self):
+        filler = FillerSegment(5.0, 5.4, "kind of", 0.7, DetectionSource.DICTIONARY)
+        adjustments = {0: CutAdjustment(filler=filler, expansion_ms=300.0, crossfade_ms=40.0)}
+        result = VerificationResult(
+            remaining_fillers=[filler], new_fillers=[], lost_words=[],
+            damaged_words=[], audio_discontinuities=[],
+        )
+        apply_adjustments(adjustments, result)
+        assert adjustments[0].expansion_ms == 550.0
+
     def test_increases_crossfade_for_audio_discontinuity(self):
         f = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
         adjustments = {0: CutAdjustment(filler=f, expansion_ms=300.0, crossfade_ms=40.0)}
@@ -306,7 +373,35 @@ class TestApplyAdjustments:
         apply_adjustments(adjustments, result)
         assert adjustments[0].expansion_ms == 200.0
 
-    def test_skips_filler_when_lost_word_very_close(self):
+    def test_uses_time_order_for_damaged_word_adjustments(self):
+        early = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
+        late = FillerSegment(8.0, 8.4, "uh", 0.4, DetectionSource.DICTIONARY)
+        damaged_word = Word("world", 5.5, 6.0, 0.4)
+        adjustments = {
+            10: CutAdjustment(filler=early, expansion_ms=300.0, crossfade_ms=40.0),
+            2: CutAdjustment(filler=late, expansion_ms=300.0, crossfade_ms=40.0),
+        }
+        result = VerificationResult(
+            remaining_fillers=[], new_fillers=[], lost_words=[],
+            damaged_words=[(damaged_word, 0)], audio_discontinuities=[],
+        )
+        apply_adjustments(adjustments, result)
+        assert adjustments[10].expansion_ms == 200.0
+        assert adjustments[2].expansion_ms == 300.0
+
+    def test_does_not_narrow_cut_that_still_has_surviving_filler(self):
+        filler = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
+        surviving = FillerSegment(4.9, 5.4, "um", 0.7, DetectionSource.DICTIONARY)
+        damaged_word = Word("world", 5.5, 6.0, 0.4)
+        adjustments = {0: CutAdjustment(filler=filler, expansion_ms=300.0, crossfade_ms=40.0)}
+        result = VerificationResult(
+            remaining_fillers=[surviving], new_fillers=[], lost_words=[],
+            damaged_words=[(damaged_word, 0)], audio_discontinuities=[],
+        )
+        apply_adjustments(adjustments, result)
+        assert adjustments[0].expansion_ms == 450.0
+
+    def test_lost_words_do_not_override_filler_removal(self):
         f = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
         lost_word = Word("hello", 4.5, 4.92, 0.95)
         adjustments = {0: CutAdjustment(filler=f, expansion_ms=300.0, crossfade_ms=40.0)}
@@ -315,9 +410,10 @@ class TestApplyAdjustments:
             damaged_words=[], audio_discontinuities=[],
         )
         apply_adjustments(adjustments, result)
-        assert adjustments[0].skip is True
+        assert adjustments[0].skip is False
+        assert adjustments[0].expansion_ms == 300.0
 
-    def test_reduces_expansion_for_lost_word_nearby(self):
+    def test_lost_word_near_cut_is_ignored(self):
         f = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
         lost_word = Word("hello", 4.0, 4.5, 0.95)
         adjustments = {0: CutAdjustment(filler=f, expansion_ms=300.0, crossfade_ms=40.0)}
@@ -327,7 +423,19 @@ class TestApplyAdjustments:
         )
         apply_adjustments(adjustments, result)
         assert adjustments[0].skip is False
-        assert adjustments[0].expansion_ms == 200.0
+        assert adjustments[0].expansion_ms == 300.0
+
+    def test_ignores_lost_word_that_is_not_near_cut(self):
+        f = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
+        lost_word = Word("hello", 0.0, 1.0, 0.95)
+        adjustments = {0: CutAdjustment(filler=f, expansion_ms=300.0, crossfade_ms=40.0)}
+        result = VerificationResult(
+            remaining_fillers=[], new_fillers=[], lost_words=[lost_word],
+            damaged_words=[], audio_discontinuities=[],
+        )
+        apply_adjustments(adjustments, result)
+        assert adjustments[0].skip is False
+        assert adjustments[0].expansion_ms == 300.0
 
     def test_adds_new_fillers(self):
         f_orig = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
@@ -341,6 +449,26 @@ class TestApplyAdjustments:
         assert len(adjustments) == 2
         assert adjustments[1].filler.word == "uh"
 
+    def test_uses_time_order_for_audio_discontinuity_adjustments(self):
+        early = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
+        late = FillerSegment(8.0, 8.3, "uh", 0.6, DetectionSource.DICTIONARY)
+        adjustments = {
+            10: CutAdjustment(filler=early, expansion_ms=300.0, crossfade_ms=40.0),
+            2: CutAdjustment(filler=late, expansion_ms=300.0, crossfade_ms=40.0),
+        }
+        result = VerificationResult(
+            remaining_fillers=[], new_fillers=[], lost_words=[],
+            damaged_words=[], audio_discontinuities=[(5.0, 8.0)],
+        )
+        segments = [
+            Segment(0.0, 5.0, TransitionType.HARD, 1.0),
+            Segment(5.5, 8.0, TransitionType.HARD, 1.0),
+            Segment(8.3, 10.0, TransitionType.HARD, 1.0),
+        ]
+        apply_adjustments(adjustments, result, segments=segments)
+        assert adjustments[10].crossfade_ms == 80.0
+        assert adjustments[2].crossfade_ms == 40.0
+
 
 class TestRebuildCuts:
     def test_rebuilds_with_wider_expansion(self):
@@ -349,6 +477,17 @@ class TestRebuildCuts:
         samples = np.zeros(16000 * 10, dtype=np.float32)
         fillers, crossfades = rebuild_cuts(adjustments, samples, 16000)
         assert len(fillers) == 1
+
+    def test_rebuilds_in_timeline_order_instead_of_key_order(self):
+        early = FillerSegment(2.0, 2.2, "um", 0.4, DetectionSource.DICTIONARY)
+        late = FillerSegment(5.0, 5.2, "uh", 0.4, DetectionSource.DICTIONARY)
+        adjustments = {
+            9: CutAdjustment(filler=late, expansion_ms=300.0, crossfade_ms=40.0),
+            1: CutAdjustment(filler=early, expansion_ms=300.0, crossfade_ms=40.0),
+        }
+        samples = np.zeros(16000 * 10, dtype=np.float32)
+        fillers, _crossfades = rebuild_cuts(adjustments, samples, 16000)
+        assert [f.word for f in fillers] == ["um", "uh"]
 
     def test_skips_marked_fillers(self):
         f = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)

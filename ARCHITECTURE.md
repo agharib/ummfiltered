@@ -47,7 +47,7 @@ Calls `probe_video(input_path)` to extract `VideoMetadata` (resolution, framerat
 Calls `extract_audio_pcm(input_path)` to produce a 16kHz mono float32 numpy array. This PCM data is used later for silence boundary detection.
 
 ### Stage 3: Transcribe
-Calls `transcribe(input_path, model_size, cloud)` to get a list of `Word` objects (text, start, end, probability). Default is local faster-whisper with the "medium" model. Cloud option: Deepgram.
+Calls `transcribe(input_path, model_size, cloud)` to get a list of `Word` objects (text, start, end, probability). Default is local faster-whisper with the "large" model. Cloud option: Deepgram.
 
 ### Stage 4: Detect Fillers
 Three-step detection:
@@ -69,7 +69,7 @@ For `INTERPOLATE` transitions, if `rife-ncnn-vulkan` is available, it generates 
 
 ### Stage 9: Render
 `render_video()` produces the final output. For multi-segment videos (the common case), it:
-1. Adds 50ms padding around each cut via `add_padding()`.
+1. Uses `add_padding()` with `0ms` default padding so cuts do not reintroduce filler audio.
 2. Extracts each segment as a `.ts` file with per-segment audio fades (40ms in/out).
 3. Concatenates all `.ts` files using ffmpeg's concat demuxer.
 4. Re-encodes with quality matched to the source (same bitrate, framerate, pixel format, audio settings).
@@ -125,7 +125,7 @@ All tunable constants:
 | `SSIM_THRESHOLD` | `0.85` | SSIM score above which a hard cut is acceptable |
 | `FRAME_SEARCH_WINDOW` | `5` | Frames to search in each direction for better cut alignment |
 | `CROSSFADE_MS` | `40` | Duration of per-segment audio fade in/out |
-| `PADDING_MS` | `50` | Padding added around cut boundaries |
+| `PADDING_MS` | `0` | Padding added around cut boundaries (disabled by default) |
 | `MIN_CONFIDENCE` | `0.15` | Default minimum transcription confidence for filler filtering |
 | `INTERPOLATION_FRAMES` | `3` | Number of intermediate frames to generate for interpolated transitions |
 | `WHISPER_FILLER_PROMPT` | `"Um, uh, so like, you know..."` | Initial prompt fed to Whisper to bias it toward detecting fillers |
@@ -190,7 +190,7 @@ All tunable constants:
 
 **`build_segment_filter(segments)`**: Builds ffmpeg `select`/`aselect` filter expressions for a simple single-pass approach. Only used when there is 1 or fewer segments (no cuts needed).
 
-**`add_padding(segments, video_duration, padding_ms=50)`**: Adds 50ms padding around each cut point. For segment i (not the first), start is pulled back by padding_ms. For segment i (not the last), end is pushed forward by padding_ms. Padding is clamped to avoid overlapping with adjacent segments. This creates a small overlap that makes cuts sound more natural.
+**`add_padding(segments, video_duration, padding_ms=0)`**: Adjusts segment edges by a fixed padding amount. Padding is clamped to avoid overlapping with adjacent segments. The default is `0ms` because the pipeline already expands cuts into silence and uses audio fades, so extra fixed padding can bring filler audio back into the output.
 
 **`_extract_segments(input_path, padded, metadata, tmpdir, crossfade_s, pause_ms)`**: Extracts each segment as an individual `.ts` file. Each segment gets:
 - Audio fade-in (40ms) and fade-out (40ms) applied via ffmpeg `afade` filter.
@@ -257,8 +257,8 @@ A single-pass approach using `select`/`aselect` filters works for simple cases b
 ### Why 40ms audio fades (CROSSFADE_MS)
 40ms is short enough to be imperceptible as a "fade effect" but long enough to prevent audio clicks/pops at cut boundaries. Without these fades, abrupt audio cuts produce audible artifacts.
 
-### Why 50ms padding (PADDING_MS)
-When a filler is removed, the preceding and following speech may sound unnatural if cut precisely at the filler boundary. Adding 50ms of the surrounding audio on each side creates a small buffer that makes the transition sound more natural — you get a tiny bit of the natural room tone and speech cadence.
+### Why padding is disabled by default (PADDING_MS)
+The pipeline already expands cuts into silence and applies audio fades. In practice, adding fixed padding around every boundary can bring filler sounds back into the output, so the default is `0ms`.
 
 ### Why silence boundary expansion
 Whisper's word timestamps are approximate (often off by 50-200ms). Cutting exactly at Whisper's boundaries can clip the beginning or end of adjacent words. By expanding into surrounding silence, the cuts happen at natural pauses in the audio, avoiding clipped speech.
@@ -319,7 +319,6 @@ Tests are run with: `python -m pytest tests/ -v`
 **Optional:**
 - rife-ncnn-vulkan (system binary, for frame interpolation)
 - deepgram-sdk >= 3.0.0 (for cloud transcription)
-- torch >= 2.0.0 (for GPU-accelerated Whisper)
 
 ---
 
@@ -329,7 +328,7 @@ Tests are run with: `python -m pytest tests/ -v`
 |---|---|---|
 | `input` | (required) | Input video file path |
 | `-o`, `--output` | `{stem}_ummfiltered.{ext}` | Output video file path |
-| `--model-size` | `medium` | Whisper model: tiny, base, small, medium, large |
+| `--model-size` | `large` | Whisper model: tiny, base, small, medium, large |
 | `--cloud` | None | Cloud transcription: deepgram |
 | `--aggressive` | False | Include contextual fillers (like, so, basically, etc.) |
 | `--interactive` | False | Review each filler before removing |
