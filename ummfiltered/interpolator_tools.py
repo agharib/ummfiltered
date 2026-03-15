@@ -11,6 +11,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from ummfiltered.runtime_paths import bin_dir, interpolators_dir
+
 
 RIFE_RELEASE_TAG = "20221029"
 RIFE_REPO_BASE = "https://github.com/nihui/rife-ncnn-vulkan/releases/download"
@@ -40,8 +42,8 @@ def provision_rife_bundle(
     install_root: Path | None = None,
     shim_dir: Path | None = None,
 ) -> str:
-    install_root = install_root or (Path.home() / ".ummfiltered" / "interpolators")
-    shim_dir = shim_dir or (Path.home() / ".ummfiltered" / "bin")
+    install_root = install_root or interpolators_dir()
+    shim_dir = shim_dir or bin_dir()
     install_root.mkdir(parents=True, exist_ok=True)
     shim_dir.mkdir(parents=True, exist_ok=True)
 
@@ -83,20 +85,28 @@ def _asset_name_for_platform(system: str | None = None) -> str:
 
 def _download_release_asset(asset_name: str, destination: Path) -> None:
     url = f"{RIFE_REPO_BASE}/{RIFE_RELEASE_TAG}/{asset_name}"
+    download_error: Exception | None = None
     try:
         context = ssl._create_unverified_context()
         with urllib.request.urlopen(url, context=context) as response:
             destination.write_bytes(response.read())
         return
-    except Exception:
-        pass
+    except Exception as exc:
+        download_error = exc
 
-    subprocess.run(
-        ["curl", "-fsSL", url, "-o", str(destination)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        subprocess.run(
+            ["curl", "-fsSL", url, "-o", str(destination)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return
+    except subprocess.CalledProcessError as exc:
+        cause = download_error or exc
+        raise RuntimeError(
+            "Unable to download rife-ncnn-vulkan for first-run setup."
+        ) from cause
 
 
 def _prepend_to_path(directory: str) -> None:

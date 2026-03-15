@@ -96,6 +96,77 @@ class CutAdjustment:
     skip: bool = False
 
 
+class PhraseAction(str, Enum):
+    DELETE = "delete"
+    SHORTEN = "shorten"
+    KEEP = "keep"
+
+
+@dataclass
+class PhraseWindow:
+    start: float
+    end: float
+    filler_indices: list[int]
+    preserved_word_count: int = 0
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
+@dataclass
+class PhraseDecision:
+    filler_index: int
+    action: PhraseAction
+    retained_duration: float = 0.0
+    reason: str = ""
+
+
+@dataclass
+class PhraseCandidate:
+    window_start: float
+    window_end: float
+    filler_indices: list[int]
+    decisions: list[PhraseDecision]
+    compression_ratio: float
+    filler_density: float
+    score: float
+    preserved_word_count: int
+    kept_fillers: int
+    shortened_fillers: int
+    deleted_fillers: int
+    rejected_reason: str = ""
+    contract_intact: bool = True
+    worst_seam_score: float = 0.0
+
+
+@dataclass
+class PhraseReport:
+    entries: list[PhraseCandidate] = field(default_factory=list)
+
+    @property
+    def scores(self) -> list[float]:
+        return [entry.score for entry in self.entries]
+
+    @property
+    def median_score(self) -> float:
+        if not self.entries:
+            return 0.0
+        ordered = sorted(self.scores)
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[mid]
+        return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+    @property
+    def p95_score(self) -> float:
+        if not self.entries:
+            return 0.0
+        ordered = sorted(self.scores)
+        idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * 0.95))))
+        return ordered[idx]
+
+
 @dataclass
 class VerificationResult:
     remaining_fillers: list[FillerSegment]
@@ -106,6 +177,7 @@ class VerificationResult:
     preserved_word_recall: float = 1.0
     max_missing_run: int = 0
     seam_report: "SeamReport | None" = None
+    phrase_report: PhraseReport | None = None
     missing_words: list[Word] = field(default_factory=list)
     output_words: list[Word] = field(default_factory=list)
     contract_tokens: list[str] = field(default_factory=list)
@@ -168,6 +240,7 @@ class SeamReportEntry:
 @dataclass
 class SeamReport:
     entries: list[SeamReportEntry] = field(default_factory=list)
+    phrase_report: PhraseReport | None = None
 
     @property
     def scores(self) -> list[float]:

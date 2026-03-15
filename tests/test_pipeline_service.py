@@ -183,3 +183,122 @@ class TestPipelineService:
 
         assert result.finalStatus.value == "dry_run"
         assert result.removedFillers == 1
+
+    def test_dry_run_prefers_shorten_for_dense_phrase(self, monkeypatch, tmp_path: Path):
+        metadata = VideoMetadata(
+            codec="h264",
+            width=320,
+            height=240,
+            framerate=30.0,
+            bitrate=1_000_000,
+            pixel_format="yuv420p",
+            duration=3.0,
+            audio_codec="aac",
+            audio_sample_rate=44100,
+            audio_channels=2,
+            audio_bitrate=128000,
+        )
+        fillers = [
+            FillerSegment(0.8, 1.1, "um", 0.5, DetectionSource.DICTIONARY),
+            FillerSegment(1.22, 1.52, "uh", 0.5, DetectionSource.DICTIONARY),
+        ]
+        words = [
+            Word("I", 0.65, 0.75, 0.99),
+            Word("um", 0.8, 1.1, 0.5),
+            Word("uh", 1.22, 1.52, 0.5),
+            Word("think", 1.62, 1.95, 0.99),
+        ]
+
+        monkeypatch.setattr("ummfiltered.pipeline.probe_video", lambda _path: metadata)
+        monkeypatch.setattr(
+            "ummfiltered.pipeline.extract_audio_pcm",
+            lambda _path, sample_rate=16000: (np.zeros(sample_rate * 3, dtype=np.float32), sample_rate),
+        )
+        monkeypatch.setattr(
+            "ummfiltered.pipeline.extract_audio_matrix",
+            lambda _path, sample_rate=44100, channel_count=2: (
+                np.zeros((sample_rate * 3, channel_count), dtype=np.float32),
+                sample_rate,
+            ),
+        )
+        monkeypatch.setattr("ummfiltered.pipeline.transcribe", lambda *_args, **_kwargs: words)
+        monkeypatch.setattr(
+            "ummfiltered.pipeline.extract_room_tone",
+            lambda *_args, **_kwargs: np.zeros(1000, dtype=np.float32),
+        )
+        monkeypatch.setattr("ummfiltered.pipeline.detect_fillers", lambda *_args, **_kwargs: fillers)
+        monkeypatch.setattr(
+            "ummfiltered.pipeline.filter_fillers_by_context",
+            lambda detected, *_args, **_kwargs: detected,
+        )
+        monkeypatch.setattr(
+            "ummfiltered.pipeline.expand_zero_duration_fillers",
+            lambda detected, _words: detected,
+        )
+
+        result = run_pipeline(
+            input_path=tmp_path / "input.mp4",
+            output_path=tmp_path / "output.mp4",
+            dry_run=True,
+        )
+
+        assert result.finalStatus.value == "dry_run"
+        assert result.removedFillers == 2
+        assert result.removedSeconds < sum(filler.end - filler.start for filler in fillers)
+
+    def test_dry_run_keeps_contextual_filler_when_phrase_guard_says_so(self, monkeypatch, tmp_path: Path):
+        metadata = VideoMetadata(
+            codec="h264",
+            width=320,
+            height=240,
+            framerate=30.0,
+            bitrate=1_000_000,
+            pixel_format="yuv420p",
+            duration=2.0,
+            audio_codec="aac",
+            audio_sample_rate=44100,
+            audio_channels=2,
+            audio_bitrate=128000,
+        )
+        filler = FillerSegment(0.9, 1.1, "like", 0.5, DetectionSource.CONTEXTUAL)
+        words = [
+            Word("it", 0.75, 0.85, 0.99),
+            Word("like", 0.9, 1.1, 0.5),
+            Word("works", 1.15, 1.45, 0.99),
+        ]
+
+        monkeypatch.setattr("ummfiltered.pipeline.probe_video", lambda _path: metadata)
+        monkeypatch.setattr(
+            "ummfiltered.pipeline.extract_audio_pcm",
+            lambda _path, sample_rate=16000: (np.zeros(sample_rate * 2, dtype=np.float32), sample_rate),
+        )
+        monkeypatch.setattr(
+            "ummfiltered.pipeline.extract_audio_matrix",
+            lambda _path, sample_rate=44100, channel_count=2: (
+                np.zeros((sample_rate * 2, channel_count), dtype=np.float32),
+                sample_rate,
+            ),
+        )
+        monkeypatch.setattr("ummfiltered.pipeline.transcribe", lambda *_args, **_kwargs: words)
+        monkeypatch.setattr(
+            "ummfiltered.pipeline.extract_room_tone",
+            lambda *_args, **_kwargs: np.zeros(1000, dtype=np.float32),
+        )
+        monkeypatch.setattr("ummfiltered.pipeline.detect_fillers", lambda *_args, **_kwargs: [filler])
+        monkeypatch.setattr(
+            "ummfiltered.pipeline.filter_fillers_by_context",
+            lambda detected, *_args, **_kwargs: detected,
+        )
+        monkeypatch.setattr(
+            "ummfiltered.pipeline.expand_zero_duration_fillers",
+            lambda detected, _words: detected,
+        )
+
+        result = run_pipeline(
+            input_path=tmp_path / "input.mp4",
+            output_path=tmp_path / "output.mp4",
+            dry_run=True,
+        )
+
+        assert result.finalStatus.value == "dry_run"
+        assert result.removedFillers == 0

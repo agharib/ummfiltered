@@ -3,7 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ummfiltered.models import (
-    CutAdjustment, DetectionSource, FillerSegment, Segment,
+    CutAdjustment, DetectionSource, FillerSegment, PhraseAction, PhraseCandidate, PhraseDecision, PhraseReport, Segment,
     TransitionType, VerificationResult, Word,
 )
 from ummfiltered.verify import (
@@ -163,6 +163,30 @@ class TestCheckRemainingFillers:
         remaining, new = check_remaining_fillers(
             output_words, original_fillers, segments,
             aggressive=False, min_confidence=0.15,
+        )
+        assert len(remaining) == 0
+        assert len(new) == 0
+
+    def test_ignores_intentionally_allowed_fillers(self):
+        original_fillers = [
+            FillerSegment(5.0, 5.5, "like", 0.4, DetectionSource.CONTEXTUAL),
+        ]
+        segments = [
+            Segment(0.0, 5.0, TransitionType.HARD, 1.0),
+            Segment(5.5, 10.0, TransitionType.HARD, 1.0),
+        ]
+        output_words = [
+            Word("hello", 0.0, 0.5, 0.95),
+            Word("like", 4.8, 5.0, 0.6),
+            Word("world", 5.0, 5.5, 0.92),
+        ]
+        remaining, new = check_remaining_fillers(
+            output_words,
+            original_fillers,
+            segments,
+            aggressive=False,
+            min_confidence=0.15,
+            allowed_fillers=original_fillers,
         )
         assert len(remaining) == 0
         assert len(new) == 0
@@ -518,3 +542,36 @@ class TestRebuildCuts:
         samples = np.zeros(16000 * 10, dtype=np.float32)
         fillers, crossfades = rebuild_cuts(adjustments, samples, 16000)
         assert len(fillers) == 0
+
+
+class TestPhraseAwareAdjustments:
+    def test_overcompressed_phrase_reduces_expansion_for_overlapping_fillers(self):
+        filler = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
+        adjustments = {0: CutAdjustment(filler=filler, expansion_ms=300.0, crossfade_ms=40.0)}
+        phrase_report = PhraseReport(entries=[
+            PhraseCandidate(
+                window_start=4.8,
+                window_end=5.8,
+                filler_indices=[0],
+                decisions=[PhraseDecision(filler_index=0, action=PhraseAction.DELETE)],
+                compression_ratio=0.5,
+                filler_density=0.5,
+                score=1.0,
+                preserved_word_count=1,
+                kept_fillers=0,
+                shortened_fillers=0,
+                deleted_fillers=1,
+            )
+        ])
+        result = VerificationResult(
+            remaining_fillers=[],
+            new_fillers=[],
+            lost_words=[],
+            damaged_words=[],
+            audio_discontinuities=[],
+            phrase_report=phrase_report,
+        )
+
+        apply_adjustments(adjustments, result)
+
+        assert adjustments[0].expansion_ms == 240.0

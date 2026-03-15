@@ -2,6 +2,14 @@ __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
+.DS_Store
 dist/
 build/
 desktop/.vite/
+desktop/release-artifacts/
+desktop/resources/macos/worker/dist/
+desktop/resources/macos/worker/manifest.json
+desktop/resources/macos/worker/pyinstaller-work/
+desktop/resources/macos/worker/spec/
+desktop/resources/macos/worker/ummfiltered-gui-worker/*
+!desktop/resources/macos/worker/ummfiltered-gui-worker/.gitkeep

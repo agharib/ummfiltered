@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 from typing import Any
 
@@ -52,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         request_payload = json.loads(args.request_file.read_text())
         gui_request = gui_request_from_dict(request_payload)
+        _validate_input_path(Path(gui_request.inputPath))
         pipeline_kwargs = resolve_gui_request(gui_request)
 
         ensure_ffmpeg_tools()
@@ -115,6 +118,24 @@ def _friendly_error_payload(exc: Exception) -> dict[str, str]:
             "message": "The app does not have permission to read or write one of the selected files.",
             "details": message,
         }
+    if isinstance(exc, RuntimeError) and "bundled ffmpeg" in lowered:
+        return {
+            "code": "missing_ffmpeg",
+            "message": "ffmpeg could not be prepared for first-run processing. Connect to the internet or install ffmpeg manually.",
+            "details": message,
+        }
+    if isinstance(exc, RuntimeError) and "rife-ncnn-vulkan" in lowered:
+        return {
+            "code": "missing_interpolator",
+            "message": "The interpolation backend could not be downloaded for first-run processing.",
+            "details": message,
+        }
+    if isinstance(exc, subprocess.CalledProcessError) and "ffprobe" in lowered:
+        return {
+            "code": "missing_input",
+            "message": "The selected input file could not be read.",
+            "details": message,
+        }
     if isinstance(exc, ImportError):
         return {
             "code": "missing_dependency",
@@ -134,6 +155,13 @@ def _install_signal_handlers(cancel_token: CancellationToken) -> None:
 
     signal.signal(signal.SIGINT, _handler)
     signal.signal(signal.SIGTERM, _handler)
+
+
+def _validate_input_path(input_path: Path) -> None:
+    if not input_path.exists() or not input_path.is_file():
+        raise FileNotFoundError(f"Input file does not exist: {input_path}")
+    if not os.access(input_path, os.R_OK):
+        raise PermissionError(f"Input file is not readable: {input_path}")
 
 
 if __name__ == "__main__":

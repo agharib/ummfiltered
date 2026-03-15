@@ -41,6 +41,7 @@ from ummfiltered.interpolator_tools import ensure_interpolator_backend
 from ummfiltered.models import (
     CutAdjustment,
     FillerSegment,
+    PhraseCandidate,
     PipelineEvent,
     PipelineEventKind,
     PipelineFinalStatus,
@@ -50,6 +51,7 @@ from ummfiltered.models import (
     TransitionType,
     VideoMetadata,
 )
+from ummfiltered.phrase_planner import apply_phrase_candidates, build_phrase_report, plan_phrase_candidates
 from ummfiltered.repair import merge_repair_decisions, repair_output_audio
 from ummfiltered.render import get_frame_at_time, probe_video, render_video, replace_audio_track
 from ummfiltered.verify import apply_adjustments, build_reference_contract, rebuild_cuts, verify_output
@@ -371,6 +373,33 @@ def _write_seam_report(output_path: Path, seam_report) -> None:
             }
             for entry in seam_report.entries
         ],
+        "phrases": [
+            {
+                "window_start": entry.window_start,
+                "window_end": entry.window_end,
+                "filler_indices": entry.filler_indices,
+                "compression_ratio": entry.compression_ratio,
+                "filler_density": entry.filler_density,
+                "score": entry.score,
+                "preserved_word_count": entry.preserved_word_count,
+                "kept_fillers": entry.kept_fillers,
+                "shortened_fillers": entry.shortened_fillers,
+                "deleted_fillers": entry.deleted_fillers,
+                "worst_seam_score": entry.worst_seam_score,
+                "rejected_reason": entry.rejected_reason,
+                "contract_intact": entry.contract_intact,
+                "decisions": [
+                    {
+                        "filler_index": decision.filler_index,
+                        "action": decision.action.value,
+                        "retained_duration": decision.retained_duration,
+                        "reason": decision.reason,
+                    }
+                    for decision in entry.decisions
+                ],
+            }
+            for entry in (seam_report.phrase_report.entries if seam_report.phrase_report else [])
+        ],
     }
     report_path.write_text(json.dumps(payload, indent=2))
 
@@ -387,6 +416,7 @@ def _render_with_audio(
     room_tone: np.ndarray,
     preserved_words: list | None = None,
     contract_tokens: list[str] | None = None,
+    phrase_candidates: list[PhraseCandidate] | None = None,
     crossfade_overrides: dict[int, float] | None = None,
     pause_overrides: dict[int, float] | None = None,
     transition_durations: dict[int, float] | None = None,
@@ -416,18 +446,26 @@ def _render_with_audio(
         edit_plan,
         room_tone,
     )
+    if phrase_candidates:
+        seam_report.phrase_report = build_phrase_report(
+            phrase_candidates,
+            edit_plan,
+            seam_report=seam_report,
+        )
     replace_audio_track(output_path, assembled_audio, native_sr, metadata)
     _write_seam_report(output_path, seam_report)
 
 
 def _result_meets_acceptance(result) -> bool:
     filler_count = len(result.remaining_fillers) + len(result.new_fillers)
+    phrase_p95 = result.phrase_report.p95_score if result.phrase_report else 0.0
     return (
         filler_count == 0
         and result.contract_intact
         and not result.lost_words
         and not result.damaged_words
         and not result.audio_discontinuities
+        and phrase_p95 < 2.5
     )
 
 
@@ -459,6 +497,8 @@ def _is_better_result(candidate, reference) -> bool:
     reference_fillers = len(reference.remaining_fillers) + len(reference.new_fillers)
     candidate_p95 = candidate.seam_report.p95_score if candidate.seam_report else float("inf")
     reference_p95 = reference.seam_report.p95_score if reference.seam_report else float("inf")
+    candidate_phrase_p95 = candidate.phrase_report.p95_score if candidate.phrase_report else float("inf")
+    reference_phrase_p95 = reference.phrase_report.p95_score if reference.phrase_report else float("inf")
 
     if candidate_fillers < reference_fillers:
         return True
@@ -472,6 +512,8 @@ def _is_better_result(candidate, reference) -> bool:
         return True
     if candidate.max_missing_run < reference.max_missing_run:
         return True
+    if candidate_phrase_p95 + 0.1 < reference_phrase_p95:
+        return True
     if candidate_p95 + SEAM_REGRESSION_MARGIN < reference_p95:
         return True
     return False
@@ -480,10 +522,12 @@ def _is_better_result(candidate, reference) -> bool:
 def _status_message(result) -> str:
     filler_count = len(result.remaining_fillers) + len(result.new_fillers)
     seam_p95 = result.seam_report.p95_score if result.seam_report else 0.0
+    phrase_p95 = result.phrase_report.p95_score if result.phrase_report else 0.0
     return (
         f"{filler_count} fillers, recall {result.preserved_word_recall:.3f}, "
         f"missing tokens {len(result.missing_tokens)}, "
-        f"max missing run {result.max_missing_run}, seam p95 {seam_p95:.3f}"
+        f"max missing run {result.max_missing_run}, seam p95 {seam_p95:.3f}, "
+        f"phrase p95 {phrase_p95:.3f}"
     )
 
 
@@ -630,10 +674,12 @@ def run_pipeline(
             fillers = interactive_filter(fillers)
 
         if dry_run:
+            phrase_candidates = plan_phrase_candidates(fillers, words)
+            cut_fillers, _allowed_fillers = apply_phrase_candidates(fillers, phrase_candidates)
             result = PipelineResult(
                 outputPath=str(output_path),
-                removedFillers=len(fillers),
-                removedSeconds=sum(f.end - f.start for f in fillers),
+                removedFillers=len(cut_fillers),
+                removedSeconds=sum(f.end - f.start for f in cut_fillers),
                 warnings=warnings,
                 finalStatus=PipelineFinalStatus.DRY_RUN,
             )
@@ -653,6 +699,8 @@ def run_pipeline(
             stage=PipelineStage.PLAN_CUTS,
             message="Planning cuts...",
         )
+        phrase_candidates = plan_phrase_candidates(fillers, words)
+        planned_fillers, allowed_fillers = apply_phrase_candidates(fillers, phrase_candidates)
         filler_ranges = {(f.start, f.end) for f in fillers}
         non_filler_words = [
             word for word in words
@@ -660,7 +708,7 @@ def run_pipeline(
         ]
         contract_tokens = build_reference_contract(words, fillers)
         expanded_fillers: list[FillerSegment] = []
-        for filler in fillers:
+        for filler in planned_fillers:
             _check_cancel(cancel_token, PipelineStage.PLAN_CUTS)
             margin_start_s, margin_end_s = _filler_margin_seconds(filler)
             padded_start = max(0.0, filler.start - margin_start_s)
@@ -714,6 +762,7 @@ def run_pipeline(
             stats={
                 "segmentCount": len(segments),
                 "removedFillers": len(expanded_fillers),
+                "phraseWindows": len(phrase_candidates),
             },
         )
 
@@ -736,6 +785,7 @@ def run_pipeline(
             room_tone,
             preserved_words=non_filler_words,
             contract_tokens=contract_tokens,
+            phrase_candidates=phrase_candidates,
             pause_overrides=pause_overrides,
             transition_durations=transition_durations,
         )
@@ -794,11 +844,15 @@ def run_pipeline(
                         model_size=model_size,
                         aggressive=aggressive,
                         min_confidence=min_confidence,
+                        allowed_fillers=allowed_fillers,
                         pause_overrides=current_pause_overrides,
                         transition_durations=current_transition_durations,
                         edit_plan=current_edit_plan,
                         reference_fillers=fillers,
+                        phrase_candidates=phrase_candidates,
                     )
+                    if result.seam_report is not None:
+                        _write_seam_report(output_path, result.seam_report)
 
                     if pass_num == 1 and _should_try_no_pause_variant(
                         result,
@@ -832,6 +886,7 @@ def run_pipeline(
                                 room_tone,
                                 preserved_words=non_filler_words,
                                 contract_tokens=contract_tokens,
+                                phrase_candidates=phrase_candidates,
                                 crossfade_overrides=None,
                                 pause_overrides=alt_pause_overrides,
                                 transition_durations=current_transition_durations,
@@ -844,11 +899,15 @@ def run_pipeline(
                                 model_size=model_size,
                                 aggressive=aggressive,
                                 min_confidence=min_confidence,
+                                allowed_fillers=allowed_fillers,
                                 pause_overrides=alt_pause_overrides,
                                 transition_durations=current_transition_durations,
                                 edit_plan=alt_edit_plan,
                                 reference_fillers=fillers,
+                                phrase_candidates=phrase_candidates,
                             )
+                            if alt_result.seam_report is not None:
+                                _write_seam_report(alt_output_path, alt_result.seam_report)
                             if _is_better_result(alt_result, result):
                                 shutil.copy2(alt_output_path, output_path)
                                 if alt_report_path.exists():
@@ -898,10 +957,12 @@ def run_pipeline(
                                     model_size=model_size,
                                     aggressive=aggressive,
                                     min_confidence=min_confidence,
+                                    allowed_fillers=allowed_fillers,
                                     pause_overrides=current_pause_overrides,
                                     transition_durations=current_transition_durations,
                                     edit_plan=current_edit_plan,
                                     reference_fillers=fillers,
+                                    phrase_candidates=phrase_candidates,
                                 )
                                 if repaired_result.seam_report is not None:
                                     repaired_result.seam_report = merge_repair_decisions(
@@ -1035,6 +1096,7 @@ def run_pipeline(
                         room_tone,
                         preserved_words=non_filler_words,
                         contract_tokens=contract_tokens,
+                        phrase_candidates=phrase_candidates,
                         crossfade_overrides=crossfade_map,
                         pause_overrides=current_pause_overrides,
                         transition_durations=current_transition_durations,
@@ -1076,6 +1138,12 @@ def run_pipeline(
         output_samples, output_sr = extract_audio_pcm(output_path)
         confirmed_fillers: list[FillerSegment] = []
         for filler in final_detected_fillers:
+            if any(
+                abs(filler.start - allowed.start) < 1.0
+                and filler.word == allowed.word
+                for allowed in allowed_fillers
+            ):
+                continue
             start = int(filler.start * output_sr)
             end = int(filler.end * output_sr)
             if start < len(output_samples) and end <= len(output_samples):

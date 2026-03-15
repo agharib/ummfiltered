@@ -4,12 +4,16 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "build:worker": "python3 ./scripts/build_macos_worker.py",
     "dev": "vite --port 1420",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest",
     "test:run": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "bundle:macos": "npm run build:worker && tauri build --bundles app,dmg",
+    "bundle:macos:app": "npm run build:worker && tauri build --bundles app",
+    "release:macos": "./scripts/release_macos_dmg.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

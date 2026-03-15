@@ -1,10 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
@@ -14,7 +13,7 @@ use std::{
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
 
 #[derive(Default)]
 struct WorkerState {
@@ -44,6 +43,13 @@ struct DesktopProcessRequest {
     overrides: DesktopOverrides,
 }
 
+struct WorkerLaunch {
+    command: PathBuf,
+    args: Vec<String>,
+    current_dir: PathBuf,
+    extra_env: Vec<(String, String)>,
+}
+
 #[tauri::command]
 fn pick_input_file() -> Result<Option<String>, String> {
     Ok(FileDialog::new()
@@ -53,7 +59,10 @@ fn pick_input_file() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn pick_output_file(default_name: String, default_dir: Option<String>) -> Result<Option<String>, String> {
+fn pick_output_file(
+    default_name: String,
+    default_dir: Option<String>,
+) -> Result<Option<String>, String> {
     let dialog = if let Some(dir) = default_dir {
         FileDialog::new().set_directory(dir)
     } else {
@@ -78,7 +87,10 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn cancel_pipeline_job(state: State<'_, Arc<WorkerState>>) -> Result<(), String> {
-    let mut child_guard = state.child.lock().map_err(|_| "Worker state is unavailable.".to_string())?;
+    let mut child_guard = state
+        .child
+        .lock()
+        .map_err(|_| "Worker state is unavailable.".to_string())?;
     if let Some(child) = child_guard.as_mut() {
         let pid = child.id().to_string();
         let status = Command::new("kill")
@@ -87,7 +99,9 @@ fn cancel_pipeline_job(state: State<'_, Arc<WorkerState>>) -> Result<(), String>
             .status()
             .map_err(|error| format!("Failed to request worker cancellation: {error}"))?;
         if !status.success() {
-            child.kill().map_err(|error| format!("Failed to force-cancel worker: {error}"))?;
+            child
+                .kill()
+                .map_err(|error| format!("Failed to force-cancel worker: {error}"))?;
         }
     }
     Ok(())
@@ -100,7 +114,10 @@ fn start_pipeline_job(
     request: DesktopProcessRequest,
 ) -> Result<(), String> {
     {
-        let child_guard = state.child.lock().map_err(|_| "Worker state is unavailable.".to_string())?;
+        let child_guard = state
+            .child
+            .lock()
+            .map_err(|_| "Worker state is unavailable.".to_string())?;
         if child_guard.is_some() {
             return Err("A processing job is already running.".to_string());
         }
@@ -115,21 +132,20 @@ fn start_pipeline_job(
         *request_guard = Some(request_path.clone());
     }
 
-    let workspace_root = workspace_root()?;
-    let python = env::var("UMMFILTERED_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let python_path = env::var("PYTHONPATH")
-        .map(|existing| format!("{existing}:{}", workspace_root.display()))
-        .unwrap_or_else(|_| workspace_root.display().to_string());
+    let launch = resolve_worker_launch(&app, &request_path)?;
 
-    let mut child = Command::new(&python)
-        .current_dir(&workspace_root)
-        .env("PYTHONPATH", python_path)
-        .arg("-m")
-        .arg("ummfiltered.gui_worker")
-        .arg("--request-file")
-        .arg(&request_path)
+    let mut child = Command::new(&launch.command);
+    child
+        .current_dir(&launch.current_dir)
+        .args(&launch.args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    for (key, value) in &launch.extra_env {
+        child.env(key, value);
+    }
+
+    let mut child = child
         .spawn()
         .map_err(|error| format!("Failed to start Python worker: {error}"))?;
 
@@ -143,7 +159,10 @@ fn start_pipeline_job(
         .ok_or_else(|| "Failed to capture worker stderr.".to_string())?;
 
     {
-        let mut child_guard = state.child.lock().map_err(|_| "Worker state is unavailable.".to_string())?;
+        let mut child_guard = state
+            .child
+            .lock()
+            .map_err(|_| "Worker state is unavailable.".to_string())?;
         *child_guard = Some(child);
     }
 
@@ -152,6 +171,89 @@ fn start_pipeline_job(
     spawn_exit_thread(app, state.inner().clone());
 
     Ok(())
+}
+
+fn resolve_worker_launch(app: &AppHandle, request_path: &Path) -> Result<WorkerLaunch, String> {
+    let app_support_dir = ensure_app_support_dir(app)?;
+
+    if let Some(worker_path) = resolve_packaged_worker_path(app)? {
+        let worker_dir = worker_path
+            .parent()
+            .ok_or_else(|| "Bundled worker directory is invalid.".to_string())?
+            .to_path_buf();
+        return Ok(WorkerLaunch {
+            command: worker_path,
+            args: vec![
+                "--request-file".to_string(),
+                request_path.display().to_string(),
+            ],
+            current_dir: worker_dir,
+            extra_env: vec![(
+                "UMMFILTERED_APP_SUPPORT".to_string(),
+                app_support_dir.display().to_string(),
+            )],
+        });
+    }
+
+    let workspace_root = workspace_root()?;
+    let python = env::var("UMMFILTERED_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let python_path = env::var("PYTHONPATH")
+        .map(|existing| format!("{existing}:{}", workspace_root.display()))
+        .unwrap_or_else(|_| workspace_root.display().to_string());
+
+    Ok(WorkerLaunch {
+        command: PathBuf::from(python),
+        args: vec![
+            "-m".to_string(),
+            "ummfiltered.gui_worker".to_string(),
+            "--request-file".to_string(),
+            request_path.display().to_string(),
+        ],
+        current_dir: workspace_root,
+        extra_env: vec![
+            ("PYTHONPATH".to_string(), python_path),
+            (
+                "UMMFILTERED_APP_SUPPORT".to_string(),
+                app_support_dir.display().to_string(),
+            ),
+        ],
+    })
+}
+
+fn resolve_packaged_worker_path(app: &AppHandle) -> Result<Option<PathBuf>, String> {
+    if let Ok(override_path) = env::var("UMMFILTERED_WORKER_PATH") {
+        let path = PathBuf::from(override_path);
+        if path.exists() {
+            return Ok(Some(path));
+        }
+        return Err(
+            "UMMFILTERED_WORKER_PATH was set but the worker binary was not found.".to_string(),
+        );
+    }
+
+    let resource_path = app
+        .path()
+        .resolve(
+            "worker/ummfiltered-gui-worker/ummfiltered-gui-worker",
+            BaseDirectory::Resource,
+        )
+        .map_err(|error| format!("Failed to resolve bundled worker path: {error}"))?;
+
+    if resource_path.exists() {
+        return Ok(Some(resource_path));
+    }
+
+    Ok(None)
+}
+
+fn ensure_app_support_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_support_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    fs::create_dir_all(&app_support_dir)
+        .map_err(|error| format!("Failed to create app data directory: {error}"))?;
+    Ok(app_support_dir)
 }
 
 fn run_macos_open<const N: usize>(args: [&str; N]) -> Result<(), String> {
@@ -181,7 +283,8 @@ fn write_request_file(request: &DesktopProcessRequest) -> Result<PathBuf, String
         .map_err(|error| format!("Failed to build request timestamp: {error}"))?
         .as_millis();
     let path = env::temp_dir().join(format!("ummfiltered-desktop-{timestamp}.json"));
-    let payload = serde_json::to_string(request).map_err(|error| format!("Failed to serialize request: {error}"))?;
+    let payload = serde_json::to_string(request)
+        .map_err(|error| format!("Failed to serialize request: {error}"))?;
     fs::write(&path, payload).map_err(|error| format!("Failed to write request file: {error}"))?;
     Ok(path)
 }

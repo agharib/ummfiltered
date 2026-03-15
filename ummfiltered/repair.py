@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import importlib
 import inspect
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -30,6 +31,8 @@ REPAIR_WINDOW_MIN_S = 0.18
 REPAIR_SEAM_THRESHOLD = 0.8
 REPAIR_NEAR_BOUNDARY_S = 0.35
 REPAIR_CANDIDATE_SPEEDS = (0.96, 1.0, 1.04)
+EXPERIMENTAL_AI_REPAIR_ENV = "UMMFILTERED_EXPERIMENTAL_AI_REPAIR"
+MAX_EXPERIMENTAL_AI_DURATION_S = 0.5
 
 
 @dataclass
@@ -269,6 +272,17 @@ def _select_repair_targets(
     return targets
 
 
+def _experimental_ai_repair_enabled() -> bool:
+    return os.environ.get(EXPERIMENTAL_AI_REPAIR_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _allow_xtts_fallback(target: _RepairTarget) -> bool:
+    return (
+        len(target.words) <= MAX_REPAIR_WORDS
+        and (target.source_end - target.source_start) <= MAX_EXPERIMENTAL_AI_DURATION_S
+    )
+
+
 def _repair_window(
     target: _RepairTarget,
     edit_plan: EditDecisionList,
@@ -505,8 +519,12 @@ def repair_output_audio(
         candidates = [candidate for candidate in [source_candidate] if candidate is not None]
 
         needs_xtts_fallback = (
-            source_candidate is None
-            or source_candidate.after_score > source_candidate.before_score + 0.05
+            _experimental_ai_repair_enabled()
+            and _allow_xtts_fallback(target)
+            and (
+                source_candidate is None
+                or source_candidate.after_score > source_candidate.before_score + 0.05
+            )
         )
         if needs_xtts_fallback:
             xtts_candidate = _candidate_from_xtts(

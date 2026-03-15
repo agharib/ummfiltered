@@ -32,11 +32,10 @@ describe("App", () => {
     tauriMocks.startPipelineJob.mockClear();
   });
 
-  it("restores persisted settings without skipping the wizard", async () => {
+  it("restores persisted settings while staying on the setup screen", () => {
     window.localStorage.setItem(
       "ummfiltered.desktop.settings.v1",
       JSON.stringify({
-        inputPath: "/tmp/restored.mov",
         preset: "quality",
         aggressive: true,
       }),
@@ -44,47 +43,35 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(screen.getByRole("heading", { name: /welcome to ummfiltered/i })).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: /start setup/i }));
-    await userEvent.click(screen.getByRole("button", { name: /choose a talking-head clip/i }));
-    await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
-    await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
-
-    expect(screen.getByRole("heading", { name: /review your cleanup settings/i })).toBeInTheDocument();
-    expect(screen.getByText("Quality")).toBeInTheDocument();
-    expect(screen.getByText(/large model · lossless export · adaptive/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /clean up talking-head videos/i })).toBeInTheDocument();
+    expect(screen.getByLabelText(/preset:/i)).toHaveValue("quality");
+    expect(screen.getByRole("button", { name: /clean my video/i })).toBeDisabled();
   });
 
-  it("moves through the wizard and finishes successfully", async () => {
+  it("lets you choose a file and complete the processing flow", async () => {
     render(<App />);
-    await userEvent.click(screen.getByRole("button", { name: /start setup/i }));
 
-    expect(screen.getByRole("heading", { name: /choose your source clip/i })).toBeInTheDocument();
+    const pickButton = screen.getByRole("button", { name: /drop your video here/i });
+    const startButton = screen.getByRole("button", { name: /clean my video/i });
 
-    await userEvent.click(screen.getByRole("button", { name: /choose a talking-head clip/i }));
+    expect(startButton).toBeDisabled();
 
-    expect(await screen.findByTestId("input-path")).toHaveTextContent("/tmp/demo.mov");
+    await userEvent.click(pickButton);
 
-    await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+    expect(await screen.findByRole("button", { name: /demo\.mov/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /clean my video/i })).toBeEnabled();
 
-    expect(screen.getByRole("heading", { name: /pick your cleanup profile/i })).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
-
-    expect(screen.getByRole("heading", { name: /review your cleanup settings/i })).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: /start cleanup/i }));
+    await userEvent.click(screen.getByRole("button", { name: /clean my video/i }));
 
     expect(tauriMocks.startPipelineJob).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("heading", { name: /cleaning up your video/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /cleaning your video/i })).toBeInTheDocument();
 
     await act(async () => {
       workerHandler?.({
         type: "event",
         kind: "stage_started",
         stage: "render",
-        message: "Stitching it all together...",
+        message: "Rendering output",
       });
       workerHandler?.({
         type: "result",
@@ -98,7 +85,7 @@ describe("App", () => {
       });
     });
 
-    expect(screen.getByRole("heading", { name: /render complete/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /your video is ready/i })).toBeInTheDocument();
     expect(screen.getByText("/tmp/demo_ummfiltered.mov")).toBeInTheDocument();
     expect(screen.getByText("7")).toBeInTheDocument();
   });

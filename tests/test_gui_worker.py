@@ -8,10 +8,12 @@ from ummfiltered.models import PipelineEvent, PipelineEventKind, PipelineFinalSt
 class TestGuiWorker:
     def test_emits_jsonl_events_and_result(self, monkeypatch, tmp_path: Path, capsys):
         request_path = tmp_path / "request.json"
+        input_path = tmp_path / "in.mp4"
+        input_path.write_bytes(b"video")
         request_path.write_text(
             json.dumps(
                 {
-                    "inputPath": "/tmp/in.mp4",
+                    "inputPath": str(input_path),
                     "preset": "balanced",
                     "aggressive": False,
                     "verifyPass": True,
@@ -56,10 +58,12 @@ class TestGuiWorker:
 
     def test_maps_missing_ffmpeg_errors(self, monkeypatch, tmp_path: Path, capsys):
         request_path = tmp_path / "request.json"
+        input_path = tmp_path / "in.mp4"
+        input_path.write_bytes(b"video")
         request_path.write_text(
             json.dumps(
                 {
-                    "inputPath": "/tmp/in.mp4",
+                    "inputPath": str(input_path),
                     "preset": "speed",
                     "aggressive": False,
                     "verifyPass": False,
@@ -72,6 +76,59 @@ class TestGuiWorker:
         monkeypatch.setattr(
             "ummfiltered.gui_worker.ensure_ffmpeg_tools",
             lambda: (_ for _ in ()).throw(FileNotFoundError("ffmpeg not found")),
+        )
+
+        exit_code = main(["--request-file", str(request_path)])
+
+        captured = json.loads(capsys.readouterr().out.strip())
+        assert exit_code == 1
+        assert captured["type"] == "error"
+        assert captured["code"] == "missing_ffmpeg"
+
+    def test_maps_missing_input_errors(self, tmp_path: Path, capsys):
+        request_path = tmp_path / "request.json"
+        request_path.write_text(
+            json.dumps(
+                {
+                    "inputPath": str(tmp_path / "missing.mp4"),
+                    "preset": "balanced",
+                    "aggressive": False,
+                    "verifyPass": True,
+                    "naturalPauses": True,
+                    "overrides": {},
+                }
+            )
+        )
+
+        exit_code = main(["--request-file", str(request_path)])
+
+        captured = json.loads(capsys.readouterr().out.strip())
+        assert exit_code == 1
+        assert captured["type"] == "error"
+        assert captured["code"] == "missing_input"
+
+    def test_maps_first_run_ffmpeg_download_failures(self, monkeypatch, tmp_path: Path, capsys):
+        request_path = tmp_path / "request.json"
+        input_path = tmp_path / "in.mp4"
+        input_path.write_bytes(b"video")
+        request_path.write_text(
+            json.dumps(
+                {
+                    "inputPath": str(input_path),
+                    "preset": "balanced",
+                    "aggressive": False,
+                    "verifyPass": True,
+                    "naturalPauses": True,
+                    "overrides": {},
+                }
+            )
+        )
+
+        monkeypatch.setattr(
+            "ummfiltered.gui_worker.ensure_ffmpeg_tools",
+            lambda: (_ for _ in ()).throw(
+                RuntimeError("Unable to download bundled ffmpeg tools for first-run setup.")
+            ),
         )
 
         exit_code = main(["--request-file", str(request_path)])

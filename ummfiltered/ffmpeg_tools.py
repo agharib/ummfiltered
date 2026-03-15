@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ummfiltered.runtime_paths import bin_dir
+
 
 def ensure_ffmpeg_tools(console=None) -> tuple[str, str]:
     ffmpeg_path = shutil.which("ffmpeg")
@@ -55,7 +57,7 @@ def provision_bundled_tools(
     shim_dir: Path | None = None,
     python_executable: str | None = None,
 ) -> tuple[str, str]:
-    shim_dir = shim_dir or (Path.home() / ".ummfiltered" / "bin")
+    shim_dir = shim_dir or bin_dir()
     python_executable = python_executable or sys.executable
     shim_dir.mkdir(parents=True, exist_ok=True)
 
@@ -73,12 +75,17 @@ def provision_bundled_tools(
 
 
 def _install_imageio_ffmpeg() -> None:
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "imageio-ffmpeg>=0.6.0"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "imageio-ffmpeg>=0.6.0"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Unable to download bundled ffmpeg tools for first-run setup."
+        ) from exc
 
 
 def _prepend_to_path(directory: str) -> None:

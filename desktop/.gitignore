@@ -1,3 +1,7 @@
 node_modules
 dist
 src-tauri/target
+release-artifacts
+resources/macos/worker/manifest.json
+resources/macos/worker/ummfiltered-gui-worker/*
+!resources/macos/worker/ummfiltered-gui-worker/.gitkeep

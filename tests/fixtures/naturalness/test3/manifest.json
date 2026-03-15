@@ -1,0 +1,8 @@
+{
+  "id": "test3",
+  "title": "Contextual filler cluster",
+  "media": "source.mp4",
+  "transcript": "expected_transcript.txt",
+  "fillers": "fillers.json",
+  "notes": "listening_notes.md"
+}

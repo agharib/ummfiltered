@@ -19,7 +19,11 @@ dependencies = [
 [project.optional-dependencies]
 cloud = ["deepgram-sdk>=3.0.0"]
 dev = ["pytest>=7.0.0", "pytest-mock>=3.0.0"]
+packaging = ["pyinstaller>=6.11.0"]
 
 [project.scripts]
 ummfiltered = "ummfiltered.cli:main"
 ummfiltered-gui-worker = "ummfiltered.gui_worker:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

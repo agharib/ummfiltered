@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useId, useState } from "react";
 
 import {
   PRESETS,
@@ -7,7 +7,6 @@ import {
   buildGuiRequest,
   deriveOutputName,
   loadPersistedSettings,
-  pauseModeLabel,
   persistSettings,
   resolvedModelSize,
   resolvedQuality,
@@ -27,14 +26,12 @@ import type {
   PauseMode,
   PipelineResult,
   PipelineStage,
+  PresetKey,
   UiSettings,
   WorkerLine,
 } from "./lib/types";
 
 type ScreenState = "setup" | "processing" | "success" | "error";
-type SetupStep = "welcome" | "input" | "preset" | "review";
-
-const SETUP_STEPS: SetupStep[] = ["welcome", "input", "preset", "review"];
 
 const STAGE_LABELS: Record<PipelineStage, string> = {
   probe: "Inspecting source",
@@ -47,29 +44,15 @@ const STAGE_LABELS: Record<PipelineStage, string> = {
   final_check: "Final quality check",
 };
 
-const STEP_TITLES: Record<SetupStep, string> = {
-  welcome: "Welcome to UmmFiltered",
-  input: "Choose your source clip",
-  preset: "Pick your cleanup profile",
-  review: "Review your cleanup settings",
-};
-
-const STEP_DESCRIPTIONS: Record<SetupStep, string> = {
-  welcome: "We’ll guide you through a short setup and have your first talking-head cleanup ready in under a minute.",
-  input: "Drag a video onto the window or choose one from disk. We’ll keep the output next to the source unless you override it.",
-  preset: "Start with the profile that matches your goal. You can still fine-tune a few switches before rendering.",
-  review: "Keep the final screen compact: the important toggles stay up front and everything deeper folds underneath.",
-};
-
 export default function App() {
   const [settings, setSettings] = useState<UiSettings>(() => loadPersistedSettings());
-  const [setupStep, setSetupStep] = useState<SetupStep>("welcome");
   const [screen, setScreen] = useState<ScreenState>("setup");
   const [activity, setActivity] = useState<string[]>([]);
   const [activeStage, setActiveStage] = useState<PipelineStage | null>(null);
   const [completedStages, setCompletedStages] = useState<PipelineStage[]>([]);
   const [result, setResult] = useState<PipelineResult | null>(null);
   const [errorMessage, setErrorMessage] = useState("");
+  const [isDragActive, setIsDragActive] = useState(false);
 
   useEffect(() => {
     persistSettings(settings);
@@ -83,6 +66,7 @@ export default function App() {
       offMessages = dispose;
     });
     void subscribeToFileDrops((path) => {
+      setIsDragActive(false);
       applyInputPath(path);
     }).then((dispose) => {
       offDrops = dispose;
@@ -94,20 +78,15 @@ export default function App() {
     };
   }, []);
 
-  const setupIndex = SETUP_STEPS.indexOf(setupStep);
-  const pipelineIndex = activeStage ? STAGE_ORDER.indexOf(activeStage) + 1 : completedStages.length;
-  const progress =
-    screen === "setup"
-      ? (setupIndex + 1) / SETUP_STEPS.length
-      : screen === "processing"
-        ? Math.max(0.1, pipelineIndex / STAGE_ORDER.length)
-        : 1;
-
+  const selectedPreset = PRESETS[settings.preset];
   const resolvedModel = resolvedModelSize(settings);
   const resolvedExport = resolvedQuality(settings);
-  const selectedPreset = PRESETS[settings.preset];
-  const canContinueInput = Boolean(settings.inputPath);
   const canStart = Boolean(settings.inputPath) && screen !== "processing";
+  const stageIndex = activeStage ? STAGE_ORDER.indexOf(activeStage) : -1;
+  const processingProgress = Math.max(
+    activity.length > 0 ? 0.16 : 0.1,
+    stageIndex >= 0 ? (stageIndex + 1) / STAGE_ORDER.length : completedStages.length / STAGE_ORDER.length,
+  );
 
   function handleWorkerLine(line: WorkerLine) {
     if (line.type === "event") {
@@ -130,7 +109,10 @@ export default function App() {
       if (line.result.finalStatus === "cancelled") {
         setScreen("setup");
         setResult(null);
-        setErrorMessage("Processing cancelled.");
+        setErrorMessage("");
+        setActivity([]);
+        setActiveStage(null);
+        setCompletedStages([]);
         return;
       }
       setResult(line.result);
@@ -150,7 +132,10 @@ export default function App() {
       if (line.code === 130) {
         setScreen("setup");
         setResult(null);
-        setErrorMessage("Processing cancelled.");
+        setErrorMessage("");
+        setActivity([]);
+        setActiveStage(null);
+        setCompletedStages([]);
         return;
       }
       if (line.code !== 0) {
@@ -164,12 +149,12 @@ export default function App() {
     if (!path) {
       return;
     }
+
     setSettings((previous) => ({
       ...previous,
       inputPath: path,
       outputPath: deriveOutputName(path),
     }));
-    setSetupStep((previous) => (previous === "welcome" ? "input" : previous));
     setScreen((previous) => (previous === "processing" ? previous : "setup"));
     setErrorMessage("");
     setResult(null);
@@ -202,7 +187,7 @@ export default function App() {
   async function handleStart() {
     try {
       const request = buildGuiRequest(settings);
-      setActivity(["Preparing worker…"]);
+      setActivity(["Preparing worker..."]);
       setCompletedStages([]);
       setActiveStage(null);
       setResult(null);
@@ -217,7 +202,7 @@ export default function App() {
 
   async function handleCancel() {
     await cancelPipelineJob();
-    setActivity((previous) => ["Cancellation requested…", ...previous].slice(0, 18));
+    setActivity((previous) => ["Cancellation requested...", ...previous].slice(0, 18));
   }
 
   async function handleReveal() {
@@ -240,57 +225,30 @@ export default function App() {
       advancedOpen: false,
     }));
     setScreen("setup");
-    setSetupStep("welcome");
     setResult(null);
     setErrorMessage("");
     setActivity([]);
     setCompletedStages([]);
     setActiveStage(null);
-  }
-
-  function advanceSetup() {
-    if (setupStep === "welcome") {
-      setSetupStep("input");
-      return;
-    }
-    if (setupStep === "input" && canContinueInput) {
-      setSetupStep("preset");
-      return;
-    }
-    if (setupStep === "preset") {
-      setSetupStep("review");
-    }
-  }
-
-  function retreatSetup() {
-    const current = SETUP_STEPS.indexOf(setupStep);
-    if (current > 0) {
-      setSetupStep(SETUP_STEPS[current - 1] ?? "welcome");
-    }
+    setIsDragActive(false);
   }
 
   return (
-    <main className="wizard-shell" data-screen={screen}>
-      <div className="wizard-glow wizard-glow-left" />
-      <div className="wizard-glow wizard-glow-right" />
-      <section className="wizard-card" data-view={screen === "setup" ? setupStep : screen}>
-        <div className="wizard-ribbons" />
-        <div className="wizard-progress">
-          <span style={{ width: `${Math.min(progress * 100, 100)}%` }} />
-        </div>
+    <main className="app-shell" data-screen={screen}>
+      <div className="shell-glow shell-glow-left" />
+      <div className="shell-glow shell-glow-right" />
 
+      <section className="app-window" data-view={screen}>
         {screen === "setup" ? (
           <SetupScreen
-            setupStep={setupStep}
             settings={settings}
             selectedPreset={selectedPreset}
             resolvedModel={resolvedModel}
             resolvedExport={resolvedExport}
-            canContinueInput={canContinueInput}
             canStart={canStart}
             errorMessage={errorMessage}
-            onAdvance={advanceSetup}
-            onBack={retreatSetup}
+            isDragActive={isDragActive}
+            onDragActiveChange={setIsDragActive}
             onPickInput={handlePickInput}
             onPickOutput={handlePickOutput}
             onPresetChange={(preset) => setSettings((previous) => applyPreset(previous, preset))}
@@ -305,6 +263,7 @@ export default function App() {
             completedStages={completedStages}
             activity={activity}
             outputPath={settings.outputPath}
+            progress={processingProgress}
             onCancel={handleCancel}
           />
         ) : null}
@@ -330,277 +289,279 @@ export default function App() {
 }
 
 function SetupScreen(props: {
-  setupStep: SetupStep;
   settings: UiSettings;
-  selectedPreset: (typeof PRESETS)[keyof typeof PRESETS];
+  selectedPreset: (typeof PRESETS)[PresetKey];
   resolvedModel: string;
   resolvedExport: string;
-  canContinueInput: boolean;
   canStart: boolean;
   errorMessage: string;
-  onAdvance: () => void;
-  onBack: () => void;
+  isDragActive: boolean;
+  onDragActiveChange: (active: boolean) => void;
   onPickInput: () => Promise<void>;
   onPickOutput: () => Promise<void>;
-  onPresetChange: (preset: keyof typeof PRESETS) => void;
+  onPresetChange: (preset: PresetKey) => void;
   onToggleChange: (patch: Partial<UiSettings>) => void;
   onStart: () => Promise<void>;
 }) {
-  const { setupStep, settings } = props;
+  const presetId = useId();
+  const selectedFile = props.settings.inputPath ? splitPath(props.settings.inputPath).base : "";
+  const outputBase = props.settings.outputPath ? splitPath(props.settings.outputPath).base : "Auto";
+
+  function handleDragEnter(event: React.DragEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    props.onDragActiveChange(true);
+  }
+
+  function handleDragOver(event: React.DragEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    props.onDragActiveChange(true);
+  }
+
+  function handleDragLeave(event: React.DragEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      return;
+    }
+    props.onDragActiveChange(false);
+  }
+
+  function handleDrop(event: React.DragEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    props.onDragActiveChange(false);
+  }
 
   return (
-    <div className={setupStep === "welcome" ? "wizard-step welcome-step" : "wizard-step"}>
-      <header className="step-header">
-        <div className="step-copy">
-          <p className="step-kicker">
-            Step {SETUP_STEPS.indexOf(setupStep) + 1} of {SETUP_STEPS.length}
-          </p>
-          <h1>{STEP_TITLES[setupStep]}</h1>
-          <p>{STEP_DESCRIPTIONS[setupStep]}</p>
-        </div>
-        {setupStep !== "welcome" ? (
-          <button className="step-back" onClick={props.onBack} type="button">
-            Back
-          </button>
-        ) : null}
+    <div className="screen screen-setup">
+      <header className="setup-header">
+        <p className="app-title">UmmFiltered</p>
+        <h1>Clean up talking-head videos</h1>
+        <p>Remove filler words and smooth pauses. Instantly.</p>
       </header>
 
-      <div className="step-body">
-        {setupStep === "welcome" ? (
-          <div className="welcome-hero">
-            <div className="welcome-pills" aria-label="Welcome highlights">
-              <span>Local-only</span>
-              <span>3 quick decisions</span>
-              <span>Under 1 minute</span>
-            </div>
-
-            <div className="welcome-summary">
-              <p className="welcome-caption">Clean up talking-head videos without opening a timeline.</p>
-              <strong>Pick a clip, choose a preset, and let UmmFiltered make the first polished pass for you.</strong>
-              <p>No cloud handoff, no review dashboard, and no busy setup screen before you can get to work.</p>
-            </div>
+      <button
+        className={
+          props.isDragActive
+            ? selectedFile
+              ? "drop-zone drag-active selected"
+              : "drop-zone drag-active"
+            : selectedFile
+              ? "drop-zone selected"
+              : "drop-zone"
+        }
+        onClick={props.onPickInput}
+        onDragEnter={handleDragEnter}
+        onDragLeave={handleDragLeave}
+        onDragOver={handleDragOver}
+        onDrop={handleDrop}
+        type="button"
+      >
+        <span className="drop-zone-backdrop" aria-hidden="true" />
+        <div className="drop-zone-icon" aria-hidden="true">
+          <VideoIcon />
+        </div>
+        <div className="drop-zone-copy">
+          <strong>{selectedFile || "Drop your video here"}</strong>
+          <span>{selectedFile ? "Drop another video or browse files" : "or browse files"}</span>
+        </div>
+        {selectedFile ? (
+          <div className="drop-zone-meta">
+            <span className="meta-pill">
+              <b>Source</b>
+              <em>{selectedFile}</em>
+            </span>
+            <span className="meta-pill subtle">
+              <b>Output</b>
+              <em>{outputBase}</em>
+            </span>
           </div>
         ) : null}
+      </button>
 
-        {setupStep === "input" ? (
-          <div className="stack">
-            <button className="hero-select" onClick={props.onPickInput} type="button">
-              <span className="hero-select-kicker">Drag video here or browse</span>
-              <strong>{settings.inputPath || "Choose a talking-head clip"}</strong>
-              <small>We’ll use the source folder for output unless you change it.</small>
-            </button>
-
-            <div className="info-block" data-testid="input-path">
-              <span className="info-label">Source clip</span>
-              <strong>{settings.inputPath || "No file selected yet"}</strong>
-            </div>
-
-            <div className="info-block">
-              <div className="info-head">
-                <div>
-                  <span className="info-label">Output location</span>
-                  <strong>{settings.outputPath || "Auto: same folder with _ummfiltered suffix"}</strong>
-                </div>
-                <button className="ghost-pill" onClick={props.onPickOutput} type="button">
-                  Change
-                </button>
-              </div>
-            </div>
+      <div className="action-bar">
+        <div className="preset-control">
+          <label className="control-label" htmlFor={presetId}>
+            Preset:
+          </label>
+          <div className="select-shell">
+            <span className="select-leading" aria-hidden="true">
+              <PresetIcon />
+            </span>
+            <select
+              id={presetId}
+              value={props.settings.preset}
+              onChange={(event) => props.onPresetChange(event.target.value as PresetKey)}
+            >
+              {(Object.keys(PRESETS) as PresetKey[]).map((preset) => (
+                <option key={preset} value={preset}>
+                  {PRESETS[preset].label}
+                </option>
+              ))}
+            </select>
+            <span className="select-icon" aria-hidden="true">
+              <ChevronIcon />
+            </span>
           </div>
-        ) : null}
+        </div>
 
-        {setupStep === "preset" ? (
-          <div className="choice-grid">
-            {(Object.keys(PRESETS) as Array<keyof typeof PRESETS>).map((preset) => (
-              <button
-                key={preset}
-                className={preset === settings.preset ? "choice-card active" : "choice-card"}
-                onClick={() => props.onPresetChange(preset)}
-                type="button"
-              >
-                <div className="choice-icon">{preset === "speed" ? "S" : preset === "balanced" ? "B" : "Q"}</div>
-                <strong>{PRESETS[preset].label}</strong>
-                <small>{PRESETS[preset].tagline}</small>
-                <span className="choice-meta">
-                  {PRESETS[preset].modelSize} · {PRESETS[preset].quality}
-                </span>
-              </button>
-            ))}
-          </div>
-        ) : null}
+        <button className="primary-button" disabled={!props.canStart} onClick={props.onStart} type="button">
+          <span>Clean My Video</span>
+          <span className="button-arrow" aria-hidden="true">
+            <ArrowIcon />
+          </span>
+        </button>
+      </div>
 
-        {setupStep === "review" ? (
-          <div className="stack">
-            <div className="review-summary">
-              <div>
-                <span className="info-label">Selected preset</span>
-                <strong>{props.selectedPreset.label}</strong>
-                <small>
-                  {props.resolvedModel} model · {props.resolvedExport} export · {pauseModeLabel(settings.pauseMode)}
-                </small>
-              </div>
-              <div>
-                <span className="info-label">Source</span>
-                <strong>{splitPath(settings.inputPath || "No clip selected").base}</strong>
-              </div>
-            </div>
+      <div className="setup-footer">
+        <div className="status-line">
+          <span className="status-dot" />
+          <span>Runs locally on your Mac - about 1 minute</span>
+        </div>
 
-            <div className="choice-grid compact">
-              <ToggleCard
-                title="Aggressive cleanup"
-                copy='Catch contextual fillers like "like" and "basically".'
-                active={settings.aggressive}
-                onClick={() => props.onToggleChange({ aggressive: !settings.aggressive })}
-              />
-              <ToggleCard
-                title="Verification pass"
-                copy="Recheck the render and rerender when the transcript looks worse."
-                active={settings.verifyPass}
-                onClick={() => props.onToggleChange({ verifyPass: !settings.verifyPass })}
-              />
-              <ToggleCard
-                title="Natural pauses"
-                copy="Keep adaptive micro-pauses so cuts still feel like speech."
-                active={settings.pauseMode !== "none"}
-                onClick={() =>
-                  props.onToggleChange({ pauseMode: settings.pauseMode === "none" ? "adaptive" : "none" })
-                }
-              />
-            </div>
-
-            <details className="review-advanced" open={settings.advancedOpen}>
-              <summary onClick={() => props.onToggleChange({ advancedOpen: !settings.advancedOpen })}>
-                More options
-              </summary>
-              <div className="advanced-stack">
-                <Field label="Model size override">
-                  <select
-                    value={settings.modelSizeOverride}
-                    onChange={(event) =>
-                      props.onToggleChange({
-                        modelSizeOverride: event.target.value as UiSettings["modelSizeOverride"],
-                      })
-                    }
-                  >
-                    <option value="auto">Preset default ({PRESETS[settings.preset].modelSize})</option>
-                    {["tiny", "base", "small", "medium", "large"].map((value) => (
-                      <option key={value} value={value}>
-                        {value}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-
-                <Field label="Export quality override">
-                  <select
-                    value={settings.qualityOverride}
-                    onChange={(event) =>
-                      props.onToggleChange({
-                        qualityOverride: event.target.value as UiSettings["qualityOverride"],
-                      })
-                    }
-                  >
-                    <option value="auto">Preset default ({PRESETS[settings.preset].quality})</option>
-                    <option value="matched">Matched</option>
-                    <option value="lossless">Lossless</option>
-                  </select>
-                </Field>
-
-                <Field label="Minimum confidence">
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    max="1"
-                    value={settings.minConfidence}
-                    onChange={(event) => props.onToggleChange({ minConfidence: event.target.value })}
-                  />
-                </Field>
-
-                <Field label="Pause mode">
-                  <select
-                    value={settings.pauseMode}
-                    onChange={(event) =>
-                      props.onToggleChange({
-                        pauseMode: event.target.value as PauseMode,
-                      })
-                    }
-                  >
-                    <option value="adaptive">Adaptive</option>
-                    <option value="none">None</option>
-                    <option value="custom">Custom ms</option>
-                  </select>
-                </Field>
-
-                <Field label="Custom pause (ms)">
-                  <input
-                    type="number"
-                    step="10"
-                    min="0"
-                    value={settings.customPauseMs}
-                    disabled={settings.pauseMode !== "custom"}
-                    onChange={(event) => props.onToggleChange({ customPauseMs: event.target.value })}
-                  />
-                </Field>
-
-                <Field label="Custom fillers">
-                  <input
-                    type="text"
-                    placeholder="anyway, right, okay"
-                    value={settings.customFillers}
-                    onChange={(event) => props.onToggleChange({ customFillers: event.target.value })}
-                  />
-                </Field>
-              </div>
-            </details>
-          </div>
-        ) : null}
+        <button
+          aria-label="More options"
+          className={props.settings.advancedOpen ? "icon-button active" : "icon-button"}
+          onClick={() => props.onToggleChange({ advancedOpen: !props.settings.advancedOpen })}
+          type="button"
+        >
+          <GearIcon />
+        </button>
       </div>
 
       {props.errorMessage ? <p className="inline-error">{props.errorMessage}</p> : null}
 
-      <footer className="step-footer">
-        {setupStep === "welcome" ? (
-          <button className="primary-cta" onClick={props.onAdvance} type="button">
-            Start setup
-          </button>
-        ) : null}
-        {setupStep === "input" ? (
-          <>
-            <button className="secondary-cta" onClick={props.onBack} type="button">
-              Back
-            </button>
+      {props.settings.advancedOpen ? (
+        <section className="advanced-panel">
+          <div className="advanced-panel-header">
+            <div>
+              <p className="advanced-kicker">More options</p>
+              <strong>Adjust the cleanup pass</strong>
+            </div>
             <button
-              className="primary-cta"
-              disabled={!props.canContinueInput}
-              onClick={props.onAdvance}
+              aria-label="Close options"
+              className="icon-button subtle"
+              onClick={() => props.onToggleChange({ advancedOpen: false })}
               type="button"
             >
-              Continue
+              <CloseIcon />
             </button>
-          </>
-        ) : null}
-        {setupStep === "preset" ? (
-          <>
-            <button className="secondary-cta" onClick={props.onBack} type="button">
-              Back
-            </button>
-            <button className="primary-cta" onClick={props.onAdvance} type="button">
-              Continue
-            </button>
-          </>
-        ) : null}
-        {setupStep === "review" ? (
-          <>
-            <button className="secondary-cta" onClick={props.onBack} type="button">
-              Back
-            </button>
-            <button className="primary-cta" disabled={!props.canStart} onClick={props.onStart} type="button">
-              Start cleanup
-            </button>
-          </>
-        ) : null}
-      </footer>
+          </div>
+
+          <p className="advanced-summary">
+            {props.selectedPreset.label} defaults to a {props.resolvedModel} model with {props.resolvedExport} export.
+          </p>
+
+          <div className="toggle-list">
+            <SwitchRow
+              active={props.settings.aggressive}
+              copy="Catch contextual fillers."
+              label="Aggressive cleanup"
+              onClick={() => props.onToggleChange({ aggressive: !props.settings.aggressive })}
+            />
+            <SwitchRow
+              active={props.settings.verifyPass}
+              copy="Run a verification pass after render."
+              label="Verification pass"
+              onClick={() => props.onToggleChange({ verifyPass: !props.settings.verifyPass })}
+            />
+            <SwitchRow
+              active={props.settings.pauseMode !== "none"}
+              copy="Keep natural pause smoothing enabled."
+              label="Natural pauses"
+              onClick={() =>
+                props.onToggleChange({ pauseMode: props.settings.pauseMode === "none" ? "adaptive" : "none" })
+              }
+            />
+          </div>
+
+          <div className="advanced-grid">
+            <Field label="Output">
+              <button className="secondary-field-button" onClick={props.onPickOutput} type="button">
+                {outputBase === "Auto" ? "Choose output file" : outputBase}
+              </button>
+            </Field>
+
+            <Field label="Model size">
+              <select
+                value={props.settings.modelSizeOverride}
+                onChange={(event) =>
+                  props.onToggleChange({
+                    modelSizeOverride: event.target.value as UiSettings["modelSizeOverride"],
+                  })
+                }
+              >
+                <option value="auto">Preset default</option>
+                {["tiny", "base", "small", "medium", "large"].map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+              </select>
+            </Field>
+
+            <Field label="Export quality">
+              <select
+                value={props.settings.qualityOverride}
+                onChange={(event) =>
+                  props.onToggleChange({
+                    qualityOverride: event.target.value as UiSettings["qualityOverride"],
+                  })
+                }
+              >
+                <option value="auto">Preset default</option>
+                <option value="matched">Matched</option>
+                <option value="lossless">Lossless</option>
+              </select>
+            </Field>
+
+            <Field label="Pause mode">
+              <select
+                value={props.settings.pauseMode}
+                onChange={(event) =>
+                  props.onToggleChange({
+                    pauseMode: event.target.value as PauseMode,
+                  })
+                }
+              >
+                <option value="adaptive">Adaptive</option>
+                <option value="none">None</option>
+                <option value="custom">Custom ms</option>
+              </select>
+            </Field>
+
+            <Field label="Custom pause (ms)">
+              <input
+                disabled={props.settings.pauseMode !== "custom"}
+                max="1000"
+                min="0"
+                step="10"
+                type="number"
+                value={props.settings.customPauseMs}
+                onChange={(event) => props.onToggleChange({ customPauseMs: event.target.value })}
+              />
+            </Field>
+
+            <Field label="Minimum confidence">
+              <input
+                max="1"
+                min="0"
+                step="0.01"
+                type="number"
+                value={props.settings.minConfidence}
+                onChange={(event) => props.onToggleChange({ minConfidence: event.target.value })}
+              />
+            </Field>
+
+            <Field className="wide" label="Custom fillers">
+              <input
+                placeholder="anyway, right, okay"
+                type="text"
+                value={props.settings.customFillers}
+                onChange={(event) => props.onToggleChange({ customFillers: event.target.value })}
+              />
+            </Field>
+          </div>
+        </section>
+      ) : null}
     </div>
   );
 }
@@ -610,56 +571,61 @@ function ProcessingScreen(props: {
   completedStages: PipelineStage[];
   activity: string[];
   outputPath: string;
+  progress: number;
   onCancel: () => Promise<void>;
 }) {
   return (
-    <div className="wizard-step">
-      <header className="step-header">
-        <div className="step-copy">
-          <p className="step-kicker">Processing</p>
-          <h1>Cleaning up your video</h1>
-          <p>
-            The Python pipeline is running underneath this wizard. You can watch each stage move forward without the UI turning into a dashboard.
-          </p>
-        </div>
+    <div className="screen state-screen">
+      <div className="screen-progress" aria-hidden="true">
+        <span style={{ width: `${Math.min(props.progress * 100, 100)}%` }} />
+      </div>
+
+      <header className="state-header">
+        <p className="app-title muted">UmmFiltered</p>
+        <h1>Cleaning your video</h1>
+        <p>Running locally through transcription, filler detection, and render.</p>
       </header>
 
-      <div className="step-body stack">
-        <div className="stage-chip-grid">
+      <section className="processing-card">
+        <div className="processing-stage">
+          <span className="processing-label">Current stage</span>
+          <strong>{props.activeStage ? STAGE_LABELS[props.activeStage] : "Preparing worker"}</strong>
+          <small>{props.outputPath || "Output will be written next to the source clip."}</small>
+        </div>
+
+        <div className="stage-list">
           {STAGE_ORDER.map((stage) => {
             const done = props.completedStages.includes(stage);
             const active = props.activeStage === stage;
             return (
               <div key={stage} className={active ? "stage-chip active" : done ? "stage-chip done" : "stage-chip"}>
-                <span />
+                <span className="stage-chip-dot" />
                 <strong>{STAGE_LABELS[stage]}</strong>
               </div>
             );
           })}
         </div>
+      </section>
 
-        <div className="processing-panel">
-          <div className="processing-copy">
-            <span className="info-label">Current stage</span>
-            <strong>{props.activeStage ? STAGE_LABELS[props.activeStage] : "Preparing worker"}</strong>
-            <small>{props.outputPath || "Output will be created next to the source clip."}</small>
-          </div>
-          <div className="activity-log">
-            {props.activity.length === 0 ? (
-              <p className="activity-empty">Waiting for the worker to begin…</p>
-            ) : (
-              props.activity.map((entry, index) => (
-                <div className="activity-row" key={`${entry}-${index}`}>
-                  {entry}
-                </div>
-              ))
-            )}
-          </div>
+      <section className="log-card">
+        <div className="log-header">
+          <span className="processing-label">Activity</span>
         </div>
-      </div>
+        <div className="activity-log">
+          {props.activity.length === 0 ? (
+            <p className="activity-empty">Waiting for the worker to begin...</p>
+          ) : (
+            props.activity.map((entry, index) => (
+              <div className="activity-row" key={`${entry}-${index}`}>
+                {entry}
+              </div>
+            ))
+          )}
+        </div>
+      </section>
 
-      <footer className="step-footer">
-        <button className="secondary-cta" onClick={props.onCancel} type="button">
+      <footer className="state-footer">
+        <button className="secondary-button" onClick={props.onCancel} type="button">
           Cancel
         </button>
       </footer>
@@ -673,48 +639,43 @@ function SuccessScreen(props: {
   onReveal: () => Promise<void>;
   onReset: () => void;
 }) {
+  const ready = props.result.finalStatus !== "no_fillers";
+
   return (
-    <div className="wizard-step">
-      <header className="step-header">
-        <div className="step-copy">
-          <p className="step-kicker">Complete</p>
-          <h1>{props.result.finalStatus === "no_fillers" ? "Already clean" : "Render complete"}</h1>
-          <p>
-            {props.result.finalStatus === "no_fillers"
-              ? "The source didn’t need a cleanup pass, so we stopped early."
-              : "Your export is ready. Open it, reveal it in Finder, or jump straight into another clip."}
-          </p>
-        </div>
+    <div className="screen state-screen">
+      <header className="state-header">
+        <p className="app-title muted">UmmFiltered</p>
+        <h1>{ready ? "Your video is ready" : "No cleanup needed"}</h1>
+        <p>
+          {ready
+            ? "The cleaned export is ready to open or reveal in Finder."
+            : "The source did not need any filler cleanup, so no new file was written."}
+        </p>
       </header>
 
-      <div className="step-body stack">
-        <div className="metric-strip">
-          <MetricCard label="Removed fillers" value={String(props.result.removedFillers)} />
-          <MetricCard label="Dead air removed" value={`${props.result.removedSeconds.toFixed(1)}s`} />
-        </div>
-        <div className="info-block">
-          <span className="info-label">{props.result.finalStatus === "no_fillers" ? "Export" : "Saved file"}</span>
-          <strong>
-            {props.result.finalStatus === "no_fillers"
-              ? "No new file was written because the source was already clean."
-              : props.result.outputPath}
-          </strong>
-        </div>
-      </div>
+      <section className="result-grid">
+        <MetricCard label="Removed fillers" value={String(props.result.removedFillers)} />
+        <MetricCard label="Time removed" value={`${props.result.removedSeconds.toFixed(1)}s`} />
+      </section>
 
-      <footer className="step-footer">
-        {props.result.finalStatus !== "no_fillers" ? (
+      <section className="result-path">
+        <span className="processing-label">{ready ? "Saved file" : "Status"}</span>
+        <strong>{ready ? props.result.outputPath : "Already clean"}</strong>
+      </section>
+
+      <footer className="state-footer multi">
+        {ready ? (
           <>
-            <button className="secondary-cta" onClick={props.onReveal} type="button">
+            <button className="secondary-button" onClick={props.onReveal} type="button">
               Reveal in Finder
             </button>
-            <button className="secondary-cta" onClick={props.onOpen} type="button">
+            <button className="secondary-button" onClick={props.onOpen} type="button">
               Open
             </button>
           </>
         ) : null}
-        <button className="primary-cta" onClick={props.onReset} type="button">
-          Process another
+        <button className="primary-button" onClick={props.onReset} type="button">
+          Process Another
         </button>
       </footer>
     </div>
@@ -723,32 +684,25 @@ function SuccessScreen(props: {
 
 function ErrorScreen(props: { message: string; onBack: () => void }) {
   return (
-    <div className="wizard-step">
-      <header className="step-header">
-        <div className="step-copy">
-          <p className="step-kicker">Attention</p>
-          <h1>Something needs a quick fix</h1>
-          <p>{props.message}</p>
-        </div>
+    <div className="screen state-screen">
+      <header className="state-header">
+        <p className="app-title muted">UmmFiltered</p>
+        <h1>Could not finish this video</h1>
+        <p>{props.message}</p>
       </header>
 
-      <footer className="step-footer">
-        <button className="primary-cta" onClick={props.onBack} type="button">
-          Back to setup
+      <footer className="state-footer">
+        <button className="primary-button" onClick={props.onBack} type="button">
+          Back To Setup
         </button>
       </footer>
     </div>
   );
 }
 
-function formatActivity(line: Extract<WorkerLine, { type: "event" }>): string {
-  const prefix = line.stage ? `${STAGE_LABELS[line.stage]}:` : "System:";
-  return `${prefix} ${line.warning || line.message}`;
-}
-
-function Field(props: { label: string; children: ReactNode }) {
+function Field(props: { label: string; children: ReactNode; className?: string }) {
   return (
-    <label className="field">
+    <label className={props.className ? `field ${props.className}` : "field"}>
       <span>{props.label}</span>
       {props.children}
     </label>
@@ -764,17 +718,83 @@ function MetricCard(props: { label: string; value: string }) {
   );
 }
 
-function ToggleCard(props: {
-  title: string;
+function SwitchRow(props: {
+  label: string;
   copy: string;
   active: boolean;
   onClick: () => void;
 }) {
   return (
-    <button className={props.active ? "toggle-card active" : "toggle-card"} onClick={props.onClick} type="button">
-      <span className="toggle-dot" />
-      <strong>{props.title}</strong>
-      <small>{props.copy}</small>
+    <button className="switch-row" onClick={props.onClick} type="button">
+      <div className="switch-copy">
+        <strong>{props.label}</strong>
+        <span>{props.copy}</span>
+      </div>
+      <span className={props.active ? "switch active" : "switch"}>
+        <span />
+      </span>
     </button>
   );
+}
+
+function VideoIcon() {
+  return (
+    <svg fill="none" height="34" viewBox="0 0 32 32" width="34" xmlns="http://www.w3.org/2000/svg">
+      <rect height="18" rx="4" stroke="currentColor" strokeWidth="1.8" width="18" x="7" y="8" />
+      <path d="M14 13.2L19 16L14 18.8V13.2Z" fill="currentColor" />
+      <path d="M11 7H21" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function ChevronIcon() {
+  return (
+    <svg fill="none" height="12" viewBox="0 0 12 12" width="12" xmlns="http://www.w3.org/2000/svg">
+      <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function ArrowIcon() {
+  return (
+    <svg fill="none" height="14" viewBox="0 0 14 14" width="14" xmlns="http://www.w3.org/2000/svg">
+      <path d="M2.75 7H11.25" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5" />
+      <path d="M7.9 3.65L11.25 7L7.9 10.35" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function PresetIcon() {
+  return (
+    <svg fill="none" height="14" viewBox="0 0 14 14" width="14" xmlns="http://www.w3.org/2000/svg">
+      <path d="M7 1.8L8.34 4.52L11.34 4.96L9.17 7.07L9.68 10.05L7 8.64L4.32 10.05L4.83 7.07L2.66 4.96L5.66 4.52L7 1.8Z" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.2" />
+    </svg>
+  );
+}
+
+function GearIcon() {
+  return (
+    <svg fill="none" height="18" viewBox="0 0 20 20" width="18" xmlns="http://www.w3.org/2000/svg">
+      <path
+        d="M8.47 2.79C8.77 1.74 10.23 1.74 10.53 2.79L10.8 3.75C10.97 4.36 11.63 4.66 12.21 4.41L13.12 4.03C14.12 3.62 15.16 4.66 14.75 5.66L14.37 6.57C14.12 7.15 14.42 7.81 15.03 7.98L15.99 8.25C17.04 8.55 17.04 10.01 15.99 10.31L15.03 10.58C14.42 10.75 14.12 11.41 14.37 11.99L14.75 12.9C15.16 13.9 14.12 14.94 13.12 14.53L12.21 14.15C11.63 13.9 10.97 14.2 10.8 14.81L10.53 15.77C10.23 16.82 8.77 16.82 8.47 15.77L8.2 14.81C8.03 14.2 7.37 13.9 6.79 14.15L5.88 14.53C4.88 14.94 3.84 13.9 4.25 12.9L4.63 11.99C4.88 11.41 4.58 10.75 3.97 10.58L3.01 10.31C1.96 10.01 1.96 8.55 3.01 8.25L3.97 7.98C4.58 7.81 4.88 7.15 4.63 6.57L4.25 5.66C3.84 4.66 4.88 3.62 5.88 4.03L6.79 4.41C7.37 4.66 8.03 4.36 8.2 3.75L8.47 2.79Z"
+        stroke="currentColor"
+        strokeWidth="1.3"
+      />
+      <circle cx="10" cy="9.28" r="2.35" stroke="currentColor" strokeWidth="1.3" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg fill="none" height="14" viewBox="0 0 14 14" width="14" xmlns="http://www.w3.org/2000/svg">
+      <path d="M3.5 3.5L10.5 10.5" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5" />
+      <path d="M10.5 3.5L3.5 10.5" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function formatActivity(line: Extract<WorkerLine, { type: "event" }>): string {
+  const prefix = line.stage ? `${STAGE_LABELS[line.stage]}:` : "System:";
+  return `${prefix} ${line.warning || line.message}`;
 }

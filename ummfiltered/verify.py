@@ -16,7 +16,8 @@ from ummfiltered.config import (
 )
 from ummfiltered.detect import detect_fillers, filter_fillers_by_context
 from ummfiltered.edit_plan import boundary_points, build_edit_decision_list, build_segment_map as build_segment_map_from_plan, cut_points as cut_points_from_plan, map_output_to_original as map_output_to_original_from_plan
-from ummfiltered.models import CutAdjustment, EditDecisionList, FillerSegment, Segment, VerificationResult, Word
+from ummfiltered.models import CutAdjustment, EditDecisionList, FillerSegment, PhraseCandidate, Segment, VerificationResult, Word
+from ummfiltered.phrase_planner import PHRASE_COMPRESSION_FLOOR, build_phrase_report
 from ummfiltered.transcribe import transcribe
 
 
@@ -88,6 +89,7 @@ def check_remaining_fillers(
     segments: list[Segment],
     aggressive: bool = False,
     min_confidence: float = 0.15,
+    allowed_fillers: list[FillerSegment] | None = None,
     pause_overrides: dict[int, float] | None = None,
     transition_durations: dict[int, float] | None = None,
     edit_plan: EditDecisionList | None = None,
@@ -106,6 +108,12 @@ def check_remaining_fillers(
     new: list[FillerSegment] = []
     for filler in detected:
         original_filler = _remap_filler_to_original(filler, edit_plan)
+        if allowed_fillers and any(
+            abs(original_filler.start - allowed.start) < 1.0
+            and original_filler.word == allowed.word
+            for allowed in allowed_fillers
+        ):
+            continue
         if _is_near_known_filler(filler, original_fillers, edit_plan):
             remaining.append(original_filler)
         else:
@@ -323,10 +331,12 @@ def verify_output(
     model_size: str = "large",
     aggressive: bool = False,
     min_confidence: float = 0.15,
+    allowed_fillers: list[FillerSegment] | None = None,
     pause_overrides: dict[int, float] | None = None,
     transition_durations: dict[int, float] | None = None,
     edit_plan: EditDecisionList | None = None,
     reference_fillers: list[FillerSegment] | None = None,
+    phrase_candidates: list[PhraseCandidate] | None = None,
 ) -> VerificationResult:
     if edit_plan is None:
         edit_plan = build_edit_decision_list(
@@ -342,6 +352,7 @@ def verify_output(
         segments,
         aggressive=aggressive,
         min_confidence=min_confidence,
+        allowed_fillers=allowed_fillers,
         pause_overrides=pause_overrides,
         transition_durations=transition_durations,
         edit_plan=edit_plan,
@@ -383,6 +394,13 @@ def verify_output(
     audio_discontinuities.extend(
         check_audio_smoothness(samples, sample_rate, boundary_points(edit_plan))
     )
+    phrase_report = (
+        build_phrase_report(phrase_candidates, edit_plan, seam_report=seam_report)
+        if phrase_candidates
+        else None
+    )
+    if seam_report is not None:
+        seam_report.phrase_report = phrase_report
 
     return VerificationResult(
         remaining_fillers=remaining,
@@ -393,6 +411,7 @@ def verify_output(
         preserved_word_recall=recall,
         max_missing_run=max_missing_run,
         seam_report=seam_report,
+        phrase_report=phrase_report,
         missing_words=missing_words,
         output_words=output_words,
         contract_tokens=contract_tokens,
@@ -486,6 +505,18 @@ def apply_adjustments(
             adjustment_key = _adjustment_key_for_cut_index(adjustments, cut_idx)
             if adjustment_key is not None:
                 adjustments[adjustment_key].crossfade_ms += CROSSFADE_INCREMENT_MS
+
+    if result.phrase_report:
+        for phrase_entry in result.phrase_report.entries:
+            if phrase_entry.compression_ratio >= PHRASE_COMPRESSION_FLOOR:
+                continue
+            for key, adjustment in adjustments.items():
+                filler = adjustment.filler
+                if filler.end < phrase_entry.window_start or filler.start > phrase_entry.window_end:
+                    continue
+                if key in prioritized_keys:
+                    continue
+                adjustment.expansion_ms = max(80.0, adjustment.expansion_ms - 60.0)
 
 
 def _find_adjustment_for_filler(
