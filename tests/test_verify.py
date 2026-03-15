@@ -240,6 +240,29 @@ class TestCheckWordIntegrity:
         )
         assert len(damaged) >= 1
 
+    def test_excludes_filler_word_when_cut_only_partially_overlaps_transcript_timing(self):
+        original_words = [
+            Word("hello", 0.0, 0.5, 0.95),
+            Word("um", 0.60, 0.82, 0.4),
+            Word("world", 1.0, 1.5, 0.92),
+        ]
+        cut_fillers = [
+            FillerSegment(0.62, 0.80, "um", 0.4, DetectionSource.DICTIONARY),
+        ]
+        output_words = [
+            Word("hello", 0.0, 0.5, 0.95),
+            Word("world", 0.6, 1.1, 0.92),
+        ]
+        segments = [
+            Segment(0.0, 0.62, TransitionType.HARD, 1.0),
+            Segment(0.80, 1.5, TransitionType.HARD, 1.0),
+        ]
+        lost, damaged = check_word_integrity(
+            original_words, output_words, cut_fillers, segments,
+        )
+        assert [word.text for word in lost] == []
+        assert damaged == []
+
 from ummfiltered.verify import check_audio_smoothness
 
 
@@ -311,6 +334,8 @@ class TestVerifyOutput:
         )
         assert isinstance(result, VerificationResult)
         assert result.is_clean()
+        assert result.contract_intact is True
+        assert result.missing_tokens == []
 
 from ummfiltered.verify import apply_adjustments, rebuild_cuts
 
@@ -401,7 +426,7 @@ class TestApplyAdjustments:
         apply_adjustments(adjustments, result)
         assert adjustments[0].expansion_ms == 450.0
 
-    def test_lost_words_do_not_override_filler_removal(self):
+    def test_lost_words_narrow_cut_when_no_surviving_filler(self):
         f = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
         lost_word = Word("hello", 4.5, 4.92, 0.95)
         adjustments = {0: CutAdjustment(filler=f, expansion_ms=300.0, crossfade_ms=40.0)}
@@ -410,20 +435,19 @@ class TestApplyAdjustments:
             damaged_words=[], audio_discontinuities=[],
         )
         apply_adjustments(adjustments, result)
-        assert adjustments[0].skip is False
-        assert adjustments[0].expansion_ms == 300.0
+        assert adjustments[0].expansion_ms == 180.0
 
-    def test_lost_word_near_cut_is_ignored(self):
+    def test_lost_word_does_not_override_surviving_filler(self):
         f = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
+        surviving = FillerSegment(4.9, 5.4, "um", 0.7, DetectionSource.DICTIONARY)
         lost_word = Word("hello", 4.0, 4.5, 0.95)
         adjustments = {0: CutAdjustment(filler=f, expansion_ms=300.0, crossfade_ms=40.0)}
         result = VerificationResult(
-            remaining_fillers=[], new_fillers=[], lost_words=[lost_word],
+            remaining_fillers=[surviving], new_fillers=[], lost_words=[lost_word],
             damaged_words=[], audio_discontinuities=[],
         )
         apply_adjustments(adjustments, result)
-        assert adjustments[0].skip is False
-        assert adjustments[0].expansion_ms == 300.0
+        assert adjustments[0].expansion_ms == 450.0
 
     def test_ignores_lost_word_that_is_not_near_cut(self):
         f = FillerSegment(5.0, 5.5, "um", 0.4, DetectionSource.DICTIONARY)
@@ -434,7 +458,6 @@ class TestApplyAdjustments:
             damaged_words=[], audio_discontinuities=[],
         )
         apply_adjustments(adjustments, result)
-        assert adjustments[0].skip is False
         assert adjustments[0].expansion_ms == 300.0
 
     def test_adds_new_fillers(self):

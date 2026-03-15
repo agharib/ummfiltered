@@ -1,7 +1,17 @@
 import numpy as np
 import pytest
-from ummfiltered.audio import compute_rms_db, extract_room_tone, find_silence_boundaries, find_speech_onset, measure_cut_naturalness, protect_adjacent_words, smooth_rendered_audio
-from ummfiltered.models import Word
+from ummfiltered.audio import (
+    assemble_audio_track,
+    compute_rms_db,
+    extract_room_tone,
+    find_silence_boundaries,
+    find_speech_onset,
+    measure_cut_naturalness,
+    protect_adjacent_words,
+    smooth_rendered_audio,
+)
+from ummfiltered.edit_plan import build_edit_decision_list
+from ummfiltered.models import Segment, TransitionType, Word
 
 
 class TestComputeRmsDb:
@@ -70,6 +80,32 @@ class TestFindSpeechOnset:
 
 
 class TestProtectAdjacentWords:
+    def test_moves_start_past_overlapping_preserved_word(self):
+        sample_rate = 16000
+        samples = np.zeros(sample_rate * 10, dtype=np.float32)
+        non_filler_words = [Word("we", 6.58, 6.80, 0.95)]
+        result = protect_adjacent_words(
+            new_start=6.77, new_end=7.03,
+            non_filler_words=non_filler_words,
+            samples=samples, sample_rate=sample_rate,
+        )
+        assert result is not None
+        start, _end = result
+        assert start >= 6.80 + 0.009
+
+    def test_moves_end_before_overlapping_preserved_word(self):
+        sample_rate = 16000
+        samples = np.zeros(sample_rate * 10, dtype=np.float32)
+        non_filler_words = [Word("expect", 7.04, 7.26, 0.95)]
+        result = protect_adjacent_words(
+            new_start=6.80, new_end=7.12,
+            non_filler_words=non_filler_words,
+            samples=samples, sample_rate=sample_rate,
+        )
+        assert result is not None
+        _start, end = result
+        assert end <= 7.04 - 0.009
+
     def test_pulls_start_away_from_preceding_word(self):
         sample_rate = 16000
         samples = np.zeros(sample_rate * 10, dtype=np.float32)
@@ -164,3 +200,43 @@ class TestSmoothRenderedAudio:
 
         assert improved.center_drop_db <= baseline.center_drop_db + 0.05
         assert improved.score <= baseline.score + 0.05
+
+
+class TestMeasureCutNaturalness:
+    def test_handles_uneven_windows_near_clip_end(self):
+        sample_rate = 16000
+        t = np.linspace(0, 0.03, int(sample_rate * 0.03), endpoint=False, dtype=np.float32)
+        samples = 0.3 * np.sin(2 * np.pi * 220 * t)
+        metrics = measure_cut_naturalness(samples, sample_rate, cut_point=0.026)
+        assert np.isfinite(metrics.score)
+
+
+class TestAssembleAudioTrack:
+    def test_keeps_raw_boundary_when_no_safe_padding_exists(self):
+        sample_rate = 1000
+        source_audio = np.zeros((300, 2), dtype=np.float32)
+        source_audio[:100, 0] = 0.5
+        source_audio[:100, 1] = 0.4
+        source_audio[200:, 0] = -0.5
+        source_audio[200:, 1] = -0.4
+
+        segments = [
+            Segment(0.0, 0.1, TransitionType.HARD, 1.0),
+            Segment(0.2, 0.3, TransitionType.HARD, 1.0),
+        ]
+        preserved_words = [
+            Word("left", 0.0, 0.1, 0.99),
+            Word("right", 0.2, 0.3, 0.99),
+        ]
+        edit_plan = build_edit_decision_list(segments, preserved_words=preserved_words)
+        assembled, report = assemble_audio_track(
+            source_audio=source_audio,
+            sample_rate=sample_rate,
+            edit_plan=edit_plan,
+            room_tone=np.zeros((20, 2), dtype=np.float32),
+        )
+
+        expected = np.concatenate([source_audio[:100], source_audio[200:]], axis=0)
+        np.testing.assert_allclose(assembled, expected)
+        assert report.entries
+        assert report.entries[0].chosen_strategy == "raw"

@@ -2,7 +2,12 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from ummfiltered.ffmpeg_tools import ensure_ffmpeg_tools, provision_bundled_tools
+from ummfiltered.ffmpeg_tools import (
+    ensure_ffmpeg_tools,
+    ffmpeg_cmd,
+    ffprobe_cmd,
+    provision_bundled_tools,
+)
 
 
 class TestProvisionBundledTools:
@@ -68,3 +73,19 @@ class TestEnsureFfmpegTools:
         assert ffprobe_path == "/tmp/bin/ffprobe"
         mock_prepend.assert_called_once_with("/tmp/bin")
         assert fake_console.print.call_count >= 2
+
+
+class TestCommandHelpers:
+    @patch("ummfiltered.ffmpeg_tools.ensure_ffmpeg_tools")
+    def test_ffmpeg_cmd_uses_provisioned_binary(self, mock_ensure):
+        mock_ensure.return_value = ("/tmp/bin/ffmpeg", "/tmp/bin/ffprobe")
+        assert ffmpeg_cmd("-i", "input.mp4") == ["/tmp/bin/ffmpeg", "-i", "input.mp4"]
+
+    @patch("ummfiltered.ffmpeg_tools.ensure_ffmpeg_tools")
+    def test_ffprobe_cmd_uses_provisioned_binary(self, mock_ensure):
+        mock_ensure.return_value = ("/tmp/bin/ffmpeg", "/tmp/bin/ffprobe")
+        assert ffprobe_cmd("-show_streams", "input.mp4") == [
+            "/tmp/bin/ffprobe",
+            "-show_streams",
+            "input.mp4",
+        ]

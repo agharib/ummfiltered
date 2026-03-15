@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 
 from ummfiltered.config import INTERPOLATION_FRAMES
+from ummfiltered.interpolator_tools import ensure_interpolator_backend
 
 
 def save_frame_png(frame: np.ndarray, directory: Path, filename: str) -> Path:
@@ -20,12 +21,13 @@ def load_frame_png(path: Path) -> np.ndarray:
 
 
 def build_ncnn_command(input_dir: str, output_dir: str, num_frames: int) -> list[str]:
-    binary = shutil.which("rife-ncnn-vulkan") or "rife-ncnn-vulkan"
+    binary = shutil.which("rife-ncnn-vulkan") or ensure_interpolator_backend("ncnn")
     return [
         binary,
         "-i", input_dir,
         "-o", output_dir,
         "-n", str(num_frames),
+        "-m", "rife-v4",
     ]
 
 

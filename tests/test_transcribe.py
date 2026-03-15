@@ -1,5 +1,11 @@
 from unittest.mock import patch, MagicMock
-from ummfiltered.transcribe import transcribe_local, build_whisper_params, _clean_word
+from ummfiltered.transcribe import (
+    _clean_word,
+    _ensure_whisper_model,
+    _load_deepgram_sdk,
+    build_whisper_params,
+    transcribe_local,
+)
 from ummfiltered.models import Word
 from ummfiltered.config import WHISPER_FILLER_PROMPT
 
@@ -59,3 +65,33 @@ class TestTranscribeLocal:
         assert words[0].text == "um"
         assert words[0].start == 1.0
         assert words[0].probability == 0.4
+
+
+class TestRuntimeProvisioning:
+    @patch("ummfiltered.transcribe.importlib.import_module")
+    @patch("ummfiltered.transcribe._install_python_dependency")
+    @patch("ummfiltered.transcribe.WhisperModel", None)
+    def test_installs_faster_whisper_when_missing(self, mock_install, mock_import_module):
+        fake_module = MagicMock()
+        fake_module.WhisperModel = MagicMock()
+        mock_import_module.return_value = fake_module
+
+        model_cls = _ensure_whisper_model()
+
+        mock_install.assert_called_once_with("faster-whisper>=1.0.0")
+        assert model_cls is fake_module.WhisperModel
+
+    @patch("ummfiltered.transcribe.importlib.import_module")
+    @patch("ummfiltered.transcribe._install_python_dependency")
+    def test_installs_deepgram_sdk_when_missing(self, mock_install, mock_import_module):
+        first = ImportError("missing")
+        fake_module = MagicMock()
+        fake_module.DeepgramClient = MagicMock()
+        fake_module.PrerecordedOptions = MagicMock()
+        mock_import_module.side_effect = [first, fake_module]
+
+        client_cls, options_cls = _load_deepgram_sdk()
+
+        mock_install.assert_called_once_with("deepgram-sdk>=3.0.0")
+        assert client_cls is fake_module.DeepgramClient
+        assert options_cls is fake_module.PrerecordedOptions

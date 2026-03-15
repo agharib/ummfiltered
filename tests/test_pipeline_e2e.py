@@ -90,8 +90,7 @@ class TestCLIParsingRefine:
 
 class TestPipelineRefinement:
     @patch("ummfiltered.pipeline.shutil.copy2")
-    @patch("ummfiltered.pipeline._smooth_audio_track")
-    @patch("ummfiltered.pipeline.render_video")
+    @patch("ummfiltered.pipeline._render_with_audio")
     @patch("ummfiltered.pipeline.verify_output")
     @patch("ummfiltered.pipeline._classify_and_generate_transitions")
     @patch("ummfiltered.pipeline.protect_adjacent_words")
@@ -100,12 +99,14 @@ class TestPipelineRefinement:
     @patch("ummfiltered.pipeline.filter_fillers_by_context")
     @patch("ummfiltered.pipeline.detect_fillers")
     @patch("ummfiltered.pipeline.transcribe")
+    @patch("ummfiltered.pipeline.extract_audio_matrix")
     @patch("ummfiltered.pipeline.extract_audio_pcm")
     @patch("ummfiltered.pipeline.probe_video")
     def test_rerenders_when_remaining_fillers_found(
         self,
         mock_probe_video,
         mock_extract_audio_pcm,
+        mock_extract_audio_matrix,
         mock_transcribe,
         mock_detect_fillers,
         mock_filter_fillers,
@@ -114,8 +115,7 @@ class TestPipelineRefinement:
         mock_protect,
         mock_classify,
         mock_verify,
-        mock_render_video,
-        mock_smooth_audio,
+        mock_render_with_audio,
         mock_copy2,
         tmp_path: Path,
     ):
@@ -150,14 +150,19 @@ class TestPipelineRefinement:
             lost_words=[],
             damaged_words=[],
             audio_discontinuities=[],
+            preserved_word_recall=1.0,
+            max_missing_run=0,
         )
 
         mock_probe_video.return_value = metadata
         mock_extract_audio_pcm.side_effect = [
             (np.zeros(16000 * 2, dtype=np.float32), 16000),
-            (np.zeros(44100 * 2, dtype=np.float32), 44100),
             (np.zeros(16000 * 2, dtype=np.float32), 16000),
         ]
+        mock_extract_audio_matrix.return_value = (
+            np.zeros((44100 * 2, 2), dtype=np.float32),
+            44100,
+        )
         mock_transcribe.side_effect = [words, words]
         mock_detect_fillers.side_effect = [[filler], []]
         mock_filter_fillers.side_effect = lambda fillers, *_args, **_kwargs: fillers
@@ -172,6 +177,8 @@ class TestPipelineRefinement:
                 lost_words=[],
                 damaged_words=[],
                 audio_discontinuities=[],
+                preserved_word_recall=0.99,
+                max_missing_run=1,
             ),
             clean_result,
         ]
@@ -182,13 +189,12 @@ class TestPipelineRefinement:
             no_refine=False,
         )
 
-        assert mock_render_video.call_count == 2
+        assert mock_render_with_audio.call_count == 2
         assert mock_verify.call_count == 2
         assert mock_copy2.call_count >= 1
 
     @patch("ummfiltered.pipeline.shutil.copy2")
-    @patch("ummfiltered.pipeline._smooth_audio_track")
-    @patch("ummfiltered.pipeline.render_video")
+    @patch("ummfiltered.pipeline._render_with_audio")
     @patch("ummfiltered.pipeline.verify_output")
     @patch("ummfiltered.pipeline._classify_and_generate_transitions")
     @patch("ummfiltered.pipeline.protect_adjacent_words")
@@ -197,12 +203,14 @@ class TestPipelineRefinement:
     @patch("ummfiltered.pipeline.filter_fillers_by_context")
     @patch("ummfiltered.pipeline.detect_fillers")
     @patch("ummfiltered.pipeline.transcribe")
+    @patch("ummfiltered.pipeline.extract_audio_matrix")
     @patch("ummfiltered.pipeline.extract_audio_pcm")
     @patch("ummfiltered.pipeline.probe_video")
     def test_keeps_best_earlier_render_when_later_pass_is_worse(
         self,
         mock_probe_video,
         mock_extract_audio_pcm,
+        mock_extract_audio_matrix,
         mock_transcribe,
         mock_detect_fillers,
         mock_filter_fillers,
@@ -211,8 +219,7 @@ class TestPipelineRefinement:
         mock_protect,
         mock_classify,
         mock_verify,
-        mock_render_video,
-        mock_smooth_audio,
+        mock_render_with_audio,
         mock_copy2,
         tmp_path: Path,
     ):
@@ -246,9 +253,12 @@ class TestPipelineRefinement:
         mock_probe_video.return_value = metadata
         mock_extract_audio_pcm.side_effect = [
             (np.zeros(16000 * 2, dtype=np.float32), 16000),
-            (np.zeros(44100 * 2, dtype=np.float32), 44100),
             (np.zeros(16000 * 2, dtype=np.float32), 16000),
         ]
+        mock_extract_audio_matrix.return_value = (
+            np.zeros((44100 * 2, 2), dtype=np.float32),
+            44100,
+        )
         mock_transcribe.side_effect = [words, words]
         mock_detect_fillers.side_effect = [[filler], []]
         mock_filter_fillers.side_effect = lambda fillers, *_args, **_kwargs: fillers
@@ -263,6 +273,8 @@ class TestPipelineRefinement:
                 lost_words=[],
                 damaged_words=[],
                 audio_discontinuities=[],
+                preserved_word_recall=0.99,
+                max_missing_run=1,
             ),
             VerificationResult(
                 remaining_fillers=[filler, worse_filler],
@@ -270,6 +282,8 @@ class TestPipelineRefinement:
                 lost_words=[],
                 damaged_words=[],
                 audio_discontinuities=[],
+                preserved_word_recall=0.98,
+                max_missing_run=2,
             ),
         ]
 
@@ -279,13 +293,12 @@ class TestPipelineRefinement:
             no_refine=False,
         )
 
-        assert mock_render_video.call_count == 2
+        assert mock_render_with_audio.call_count == 2
         assert mock_verify.call_count == 2
         assert mock_copy2.call_count >= 2
 
     @patch("ummfiltered.pipeline.shutil.copy2")
-    @patch("ummfiltered.pipeline._smooth_audio_track")
-    @patch("ummfiltered.pipeline.render_video")
+    @patch("ummfiltered.pipeline._render_with_audio")
     @patch("ummfiltered.pipeline.verify_output")
     @patch("ummfiltered.pipeline._classify_and_generate_transitions")
     @patch("ummfiltered.pipeline.protect_adjacent_words")
@@ -294,12 +307,14 @@ class TestPipelineRefinement:
     @patch("ummfiltered.pipeline.filter_fillers_by_context")
     @patch("ummfiltered.pipeline.detect_fillers")
     @patch("ummfiltered.pipeline.transcribe")
+    @patch("ummfiltered.pipeline.extract_audio_matrix")
     @patch("ummfiltered.pipeline.extract_audio_pcm")
     @patch("ummfiltered.pipeline.probe_video")
     def test_stops_when_only_audio_issues_plateau(
         self,
         mock_probe_video,
         mock_extract_audio_pcm,
+        mock_extract_audio_matrix,
         mock_transcribe,
         mock_detect_fillers,
         mock_filter_fillers,
@@ -308,8 +323,7 @@ class TestPipelineRefinement:
         mock_protect,
         mock_classify,
         mock_verify,
-        mock_render_video,
-        mock_smooth_audio,
+        mock_render_with_audio,
         mock_copy2,
         tmp_path: Path,
     ):
@@ -344,14 +358,19 @@ class TestPipelineRefinement:
             lost_words=[],
             damaged_words=[],
             audio_discontinuities=[(0.6, 8.0)],
+            preserved_word_recall=1.0,
+            max_missing_run=0,
         )
 
         mock_probe_video.return_value = metadata
         mock_extract_audio_pcm.side_effect = [
             (np.zeros(16000 * 2, dtype=np.float32), 16000),
-            (np.zeros(44100 * 2, dtype=np.float32), 44100),
             (np.zeros(16000 * 2, dtype=np.float32), 16000),
         ]
+        mock_extract_audio_matrix.return_value = (
+            np.zeros((44100 * 2, 2), dtype=np.float32),
+            44100,
+        )
         mock_transcribe.side_effect = [words, words]
         mock_detect_fillers.side_effect = [[filler], []]
         mock_filter_fillers.side_effect = lambda fillers, *_args, **_kwargs: fillers
@@ -367,12 +386,11 @@ class TestPipelineRefinement:
             no_refine=False,
         )
 
-        assert mock_render_video.call_count == 2
+        assert mock_render_with_audio.call_count == 2
         assert mock_verify.call_count == 2
 
     @patch("ummfiltered.pipeline.shutil.copy2")
-    @patch("ummfiltered.pipeline._smooth_audio_track")
-    @patch("ummfiltered.pipeline.render_video")
+    @patch("ummfiltered.pipeline._render_with_audio")
     @patch("ummfiltered.pipeline.verify_output")
     @patch("ummfiltered.pipeline._classify_and_generate_transitions")
     @patch("ummfiltered.pipeline.protect_adjacent_words")
@@ -381,12 +399,14 @@ class TestPipelineRefinement:
     @patch("ummfiltered.pipeline.filter_fillers_by_context")
     @patch("ummfiltered.pipeline.detect_fillers")
     @patch("ummfiltered.pipeline.transcribe")
+    @patch("ummfiltered.pipeline.extract_audio_matrix")
     @patch("ummfiltered.pipeline.extract_audio_pcm")
     @patch("ummfiltered.pipeline.probe_video")
     def test_does_not_plateau_when_words_are_missing(
         self,
         mock_probe_video,
         mock_extract_audio_pcm,
+        mock_extract_audio_matrix,
         mock_transcribe,
         mock_detect_fillers,
         mock_filter_fillers,
@@ -395,8 +415,7 @@ class TestPipelineRefinement:
         mock_protect,
         mock_classify,
         mock_verify,
-        mock_render_video,
-        mock_smooth_audio,
+        mock_render_with_audio,
         mock_copy2,
         tmp_path: Path,
     ):
@@ -431,6 +450,8 @@ class TestPipelineRefinement:
             lost_words=[Word("hello", 0.0, 0.5, 0.95)],
             damaged_words=[],
             audio_discontinuities=[(0.6, 8.0)],
+            preserved_word_recall=0.70,
+            max_missing_run=4,
         )
         improved_result = VerificationResult(
             remaining_fillers=[],
@@ -438,14 +459,19 @@ class TestPipelineRefinement:
             lost_words=[],
             damaged_words=[],
             audio_discontinuities=[(0.6, 8.0)],
+            preserved_word_recall=0.99,
+            max_missing_run=0,
         )
 
         mock_probe_video.return_value = metadata
         mock_extract_audio_pcm.side_effect = [
             (np.zeros(16000 * 2, dtype=np.float32), 16000),
-            (np.zeros(44100 * 2, dtype=np.float32), 44100),
             (np.zeros(16000 * 2, dtype=np.float32), 16000),
         ]
+        mock_extract_audio_matrix.return_value = (
+            np.zeros((44100 * 2, 2), dtype=np.float32),
+            44100,
+        )
         mock_transcribe.side_effect = [words, words]
         mock_detect_fillers.side_effect = [[filler], []]
         mock_filter_fillers.side_effect = lambda fillers, *_args, **_kwargs: fillers
@@ -461,5 +487,5 @@ class TestPipelineRefinement:
             no_refine=False,
         )
 
-        assert mock_render_video.call_count == 3
+        assert mock_render_with_audio.call_count == 3
         assert mock_verify.call_count == 3

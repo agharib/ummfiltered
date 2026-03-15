@@ -34,6 +34,22 @@ def ensure_ffmpeg_tools(console=None) -> tuple[str, str]:
     return ffmpeg_path, ffprobe_path
 
 
+def ffmpeg_path() -> str:
+    return ensure_ffmpeg_tools()[0]
+
+
+def ffprobe_path() -> str:
+    return ensure_ffmpeg_tools()[1]
+
+
+def ffmpeg_cmd(*args: object) -> list[str]:
+    return [ffmpeg_path(), *(str(arg) for arg in args)]
+
+
+def ffprobe_cmd(*args: object) -> list[str]:
+    return [ffprobe_path(), *(str(arg) for arg in args)]
+
+
 def provision_bundled_tools(
     ffmpeg_exe: Path,
     shim_dir: Path | None = None,

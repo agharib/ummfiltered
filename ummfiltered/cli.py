@@ -5,7 +5,7 @@ from pathlib import Path
 from rich.console import Console
 
 from ummfiltered.ffmpeg_tools import ensure_ffmpeg_tools
-from ummfiltered.pipeline import run_pipeline
+from ummfiltered.pipeline import RichPipelineReporter, run_pipeline
 
 console = Console()
 
@@ -57,6 +57,7 @@ def main(argv: list[str] | None = None) -> None:
     console.print(f"[bold]ummfiltered[/bold] — processing {args.input.name}\n")
 
     custom_fillers = args.fillers.split(",") if args.fillers else None
+    reporter = RichPipelineReporter(console)
 
     run_pipeline(
         input_path=args.input,
@@ -72,6 +73,7 @@ def main(argv: list[str] | None = None) -> None:
         min_confidence=args.min_confidence,
         pause_ms=args.pause_ms,
         no_refine=args.no_refine,
+        reporter=reporter,
     )
 
 

@@ -1,25 +1,139 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 from pathlib import Path
 import shutil
 import tempfile
+from typing import Callable, Protocol
 
 import numpy as np
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from ummfiltered.audio import compute_rms_db, extract_audio_pcm, extract_room_tone, find_silence_boundaries, find_speech_onset, protect_adjacent_words, smooth_rendered_audio
-from ummfiltered.config import CROSSFADE_MS, FILLER_MARGIN_END_MS, FILLER_MARGIN_START_MS, MAX_EXPANSION_MS, PHRASE_MARGIN_END_BONUS_MS, PHRASE_MARGIN_START_BONUS_MS, SILENCE_THRESHOLD_DB, compute_adaptive_pause
+from ummfiltered.audio import (
+    assemble_audio_track,
+    compute_rms_db,
+    extract_audio_matrix,
+    extract_audio_pcm,
+    extract_room_tone,
+    find_silence_boundaries,
+    protect_adjacent_words,
+)
+from ummfiltered.config import (
+    CROSSFADE_MS,
+    FILLER_MARGIN_END_MS,
+    FILLER_MARGIN_START_MS,
+    MAX_EXPANSION_MS,
+    PHRASE_MARGIN_END_BONUS_MS,
+    PHRASE_MARGIN_START_BONUS_MS,
+    SILENCE_THRESHOLD_DB,
+    compute_adaptive_pause,
+)
 from ummfiltered.cut_planner import build_keep_segments, classify_transitions
-from ummfiltered.detect import detect_fillers, expand_zero_duration_fillers, filter_fillers_by_context
+from ummfiltered.detect import (
+    detect_fillers,
+    expand_zero_duration_fillers,
+    filter_fillers_by_context,
+)
+from ummfiltered.edit_plan import build_edit_decision_list
 from ummfiltered.interpolate import interpolate_frames
-from ummfiltered.models import CutAdjustment, FillerSegment, Segment, TransitionType
+from ummfiltered.interpolator_tools import ensure_interpolator_backend
+from ummfiltered.models import (
+    CutAdjustment,
+    FillerSegment,
+    PipelineEvent,
+    PipelineEventKind,
+    PipelineFinalStatus,
+    PipelineResult,
+    PipelineStage,
+    Segment,
+    TransitionType,
+    VideoMetadata,
+)
+from ummfiltered.repair import merge_repair_decisions, repair_output_audio
 from ummfiltered.render import get_frame_at_time, probe_video, render_video, replace_audio_track
-from ummfiltered.verify import apply_adjustments, rebuild_cuts, verify_output
+from ummfiltered.verify import apply_adjustments, build_reference_contract, rebuild_cuts, verify_output
 from ummfiltered.transcribe import transcribe
 
 console = Console()
+RECALL_THRESHOLD = 0.98
+MAX_MISSING_RUN = 3
+SEAM_REGRESSION_MARGIN = 0.15
+
+
+class ReporterLike(Protocol):
+    def emit(self, event: PipelineEvent) -> None: ...
+
+
+class CancellationToken:
+    def __init__(self) -> None:
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+
+class PipelineCancelledError(RuntimeError):
+    pass
+
+
+class RichPipelineReporter:
+    _stage_prefix = {
+        PipelineStage.PROBE: "  📼",
+        PipelineStage.EXTRACT_AUDIO: "  🎙️",
+        PipelineStage.TRANSCRIBE: "  🧠",
+        PipelineStage.DETECT_FILLERS: "  🔍",
+        PipelineStage.PLAN_CUTS: "  ✂️",
+        PipelineStage.RENDER: "  🧵",
+        PipelineStage.VERIFY: "  🔄",
+        PipelineStage.FINAL_CHECK: "  ✅",
+    }
+
+    def __init__(self, rich_console: Console | None = None) -> None:
+        self.console = rich_console or console
+
+    def emit(self, event: PipelineEvent) -> None:
+        prefix = self._stage_prefix.get(event.stage, "  •")
+        if event.kind == PipelineEventKind.STAGE_STARTED:
+            self.console.print(f"{prefix} [bold]{event.message}[/bold]")
+            return
+        if event.kind == PipelineEventKind.STAGE_COMPLETED:
+            self.console.print(f"{prefix} [dim]{event.message}[/dim] [green]done[/green]")
+            return
+        if event.kind == PipelineEventKind.INFO:
+            self.console.print(f"{prefix} [dim]{event.message}[/dim]")
+            return
+        if event.kind == PipelineEventKind.WARNING:
+            self.console.print(f"{prefix} [yellow]{event.warning or event.message}[/yellow]")
+            return
+        if event.kind == PipelineEventKind.ERROR:
+            self.console.print(f"{prefix} [red]{event.message}[/red]")
+            return
+        if event.kind == PipelineEventKind.CANCELLED:
+            self.console.print(f"{prefix} [yellow]{event.message}[/yellow]")
+            return
+        if event.kind == PipelineEventKind.RESULT and event.stats:
+            removed_fillers = event.stats.get("removedFillers", 0)
+            removed_seconds = float(event.stats.get("removedSeconds", 0.0))
+            output_path = event.stats.get("outputPath", "")
+            if event.stats.get("finalStatus") == PipelineFinalStatus.NO_FILLERS.value:
+                self.console.print("  [green bold]✨ No filler words detected! Already clean.[/green bold]\n")
+                return
+            if event.stats.get("finalStatus") == PipelineFinalStatus.DRY_RUN.value:
+                self.console.print(
+                    f"  [yellow]Dry run:[/yellow] would remove [bold]{removed_fillers}[/bold] fillers"
+                )
+                return
+            self.console.print()
+            self.console.print(f"  [green bold]✨ {removed_fillers} filler words removed[/green bold]")
+            self.console.print(
+                f"  [green bold]⏱️  {_format_duration(removed_seconds)} of dead air eliminated[/green bold]"
+            )
+            self.console.print("  [green bold]🔊 Audio gaps closed naturally[/green bold]")
+            self.console.print(f"\n  [bold]Saved to[/bold] {output_path}\n")
 
 
 def _format_duration(seconds: float) -> str:
@@ -37,7 +151,7 @@ def _display_filler_bars(fillers: list[FillerSegment]) -> None:
 
     console.print()
     max_count = max(counts.values())
-    max_label_len = max(len(w) for w in counts)
+    max_label_len = max(len(word) for word in counts)
     bar_max = 30
 
     for word, count in counts.most_common():
@@ -49,12 +163,66 @@ def _display_filler_bars(fillers: list[FillerSegment]) -> None:
     console.print()
 
 
-def _spinner(description: str):
-    return Progress(
-        SpinnerColumn("dots"),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
+def interactive_filter(fillers: list[FillerSegment]) -> list[FillerSegment]:
+    kept: list[FillerSegment] = []
+    for filler in fillers:
+        console.print(
+            f"\n[cyan]{filler.start:.2f}s - {filler.end:.2f}s[/cyan]: "
+            f"[bold]{filler.word}[/bold] "
+            f"(confidence: {filler.confidence:.2f}, source: {filler.source.value})"
+        )
+        response = console.input("[yellow]Remove? [Y/n]: [/yellow]").strip().lower()
+        if response in ("", "y", "yes"):
+            kept.append(filler)
+    return kept
+
+
+def _emit(
+    reporter: ReporterLike | Callable[[PipelineEvent], None] | None,
+    *,
+    kind: PipelineEventKind,
+    stage: PipelineStage | None,
+    message: str,
+    warning: str | None = None,
+    stats: dict[str, int | float | str | bool] | None = None,
+) -> None:
+    if reporter is None:
+        return
+
+    event = PipelineEvent(
+        kind=kind,
+        stage=stage,
+        message=message,
+        warning=warning,
+        stats=stats,
+    )
+    emit = getattr(reporter, "emit", None)
+    if callable(emit):
+        emit(event)
+        return
+    reporter(event)
+
+
+def _check_cancel(cancel_token: CancellationToken | None, stage: PipelineStage) -> None:
+    if cancel_token is None:
+        return
+    if cancel_token.is_cancelled():
+        raise PipelineCancelledError(f"Cancelled during {stage.value}")
+
+
+def _warning(
+    warnings: list[str],
+    reporter: ReporterLike | Callable[[PipelineEvent], None] | None,
+    stage: PipelineStage,
+    message: str,
+) -> None:
+    warnings.append(message)
+    _emit(
+        reporter,
+        kind=PipelineEventKind.WARNING,
+        stage=stage,
+        message=message,
+        warning=message,
     )
 
 
@@ -67,62 +235,40 @@ def _verification_score(result) -> tuple[int, int, int, int]:
     )
 
 
-def interactive_filter(fillers: list[FillerSegment]) -> list[FillerSegment]:
-    kept: list[FillerSegment] = []
-    for f in fillers:
-        console.print(f"\n[cyan]{f.start:.2f}s - {f.end:.2f}s[/cyan]: [bold]{f.word}[/bold] (confidence: {f.confidence:.2f}, source: {f.source.value})")
-        response = console.input("[yellow]Remove? [Y/n]: [/yellow]").strip().lower()
-        if response in ("", "y", "yes"):
-            kept.append(f)
-    return kept
-
-
-
-def _compute_cut_points(
-    segments: list[Segment],
-    pause_overrides: dict[int, float] | None = None,
-    transition_durations: dict[int, float] | None = None,
-) -> list[float]:
-    cut_points: list[float] = []
-    output_offset = 0.0
-    for i, seg in enumerate(segments):
-        seg_dur = seg.end - seg.start
-        if seg_dur < 0.001:
-            continue
-        output_offset += seg_dur
-        pause = pause_overrides.get(i, 0.0) if pause_overrides else 0.0
-        output_offset += pause
-        if i < len(segments) - 1:
-            cut_points.append(output_offset)
-            transition_duration = transition_durations.get(i + 1, 0.0) if transition_durations else 0.0
-            if transition_duration > 0:
-                output_offset += transition_duration
-                cut_points.append(output_offset)
-    return cut_points
-
-
 def _smooth_audio_track(
     output_path: Path,
     segments: list[Segment],
     room_tone: np.ndarray,
     native_sr: int,
-    metadata: "VideoMetadata",
+    metadata: VideoMetadata,
     pause_overrides: dict[int, float] | None = None,
     transition_durations: dict[int, float] | None = None,
 ) -> None:
+    # Compatibility shim for older tests and callers. The primary path now assembles
+    # output audio directly from the source track inside `_render_with_audio()`.
     rendered_audio, _ = extract_audio_pcm(output_path, sample_rate=native_sr)
-    cut_points = _compute_cut_points(segments, pause_overrides, transition_durations)
-    smoothed = smooth_rendered_audio(rendered_audio, native_sr, cut_points, room_tone)
-    replace_audio_track(output_path, smoothed, native_sr, metadata)
+    replace_audio_track(output_path, rendered_audio, native_sr, metadata)
 
 
 def _build_pause_overrides(fillers: list[FillerSegment]) -> dict[int, float] | None:
     overrides: dict[int, float] = {}
-    for filler_idx, f in enumerate(fillers):
-        adaptive = compute_adaptive_pause(f.end - f.start)
+    for filler_index, filler in enumerate(fillers):
+        adaptive = compute_adaptive_pause(filler.end - filler.start)
         if adaptive > 0:
-            overrides[filler_idx] = adaptive
+            overrides[filler_index] = adaptive
     return overrides or None
+
+
+def _resolve_pause_overrides(
+    fillers: list[FillerSegment],
+    pause_ms: float | None,
+) -> dict[int, float] | None:
+    if pause_ms is None:
+        return None
+    pause_s = max(0.0, pause_ms / 1000.0)
+    if pause_s == 0:
+        return None
+    return {index: pause_s for index in range(len(fillers))}
 
 
 def _filler_margin_seconds(filler: FillerSegment) -> tuple[float, float]:
@@ -137,37 +283,56 @@ def _filler_margin_seconds(filler: FillerSegment) -> tuple[float, float]:
 def _classify_and_generate_transitions(
     segments: list[Segment],
     input_path: Path,
-    metadata: "VideoMetadata",
+    metadata: VideoMetadata,
     interpolator: str,
+    reporter: ReporterLike | Callable[[PipelineEvent], None] | None = None,
+    warnings: list[str] | None = None,
+    cancel_token: CancellationToken | None = None,
 ) -> tuple[list[Segment], dict[int, list[np.ndarray]]]:
-    def get_frame(t: float):
-        return get_frame_at_time(input_path, t, metadata.width, metadata.height)
+    def get_frame(time_s: float):
+        return get_frame_at_time(input_path, time_s, metadata.width, metadata.height)
 
-    with _spinner("") as progress:
-        progress.add_task("  👀  [bold]Smoothing cadence...[/bold]", total=None)
-        segments = classify_transitions(segments, get_frame, framerate=metadata.framerate)
-    console.print("  👀  [dim]Smoothing cadence...[/dim] [green]done[/green]")
+    _check_cancel(cancel_token, PipelineStage.PLAN_CUTS)
+    segments = classify_transitions(segments, get_frame, framerate=metadata.framerate)
 
     interpolated_frames_map: dict[int, list[np.ndarray]] = {}
-    interp_count = sum(1 for s in segments[1:] if s.transition_type == TransitionType.INTERPOLATE)
+    interp_count = sum(1 for segment in segments[1:] if segment.transition_type == TransitionType.INTERPOLATE)
     if interp_count == 0:
         return segments, interpolated_frames_map
 
-    with _spinner("") as progress:
-        progress.add_task("  🎞️  [bold]Generating transition frames...[/bold]", total=None)
-        for i in range(1, len(segments)):
-            if segments[i].transition_type != TransitionType.INTERPOLATE:
-                continue
+    try:
+        ensure_interpolator_backend(interpolator, console if isinstance(reporter, RichPipelineReporter) else None)
+    except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError, ValueError):
+        for segment in segments[1:]:
+            if segment.transition_type == TransitionType.INTERPOLATE:
+                segment.transition_type = TransitionType.HARD
+        if warnings is not None:
+            _warning(
+                warnings,
+                reporter,
+                PipelineStage.PLAN_CUTS,
+                "Frame interpolation backend was unavailable. Falling back to hard cuts.",
+            )
+        return segments, interpolated_frames_map
 
-            frame_a = get_frame(segments[i - 1].end)
-            frame_b = get_frame(segments[i].start)
-            try:
-                frames = interpolate_frames(frame_a, frame_b, backend=interpolator)
-                interpolated_frames_map[i] = frames
-            except FileNotFoundError:
-                segments[i].transition_type = TransitionType.HARD
-    console.print("  🎞️  [dim]Generating transition frames...[/dim] [green]done[/green]")
-
+    for index in range(1, len(segments)):
+        _check_cancel(cancel_token, PipelineStage.PLAN_CUTS)
+        if segments[index].transition_type != TransitionType.INTERPOLATE:
+            continue
+        frame_a = get_frame(segments[index - 1].end)
+        frame_b = get_frame(segments[index].start)
+        try:
+            frames = interpolate_frames(frame_a, frame_b, backend=interpolator)
+            interpolated_frames_map[index] = frames
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            segments[index].transition_type = TransitionType.HARD
+            if warnings is not None:
+                _warning(
+                    warnings,
+                    reporter,
+                    PipelineStage.PLAN_CUTS,
+                    "Frame interpolation backend was unavailable. Falling back to hard cuts.",
+                )
     return segments, interpolated_frames_map
 
 
@@ -176,9 +341,176 @@ def _transition_durations(
     framerate: float,
 ) -> dict[int, float]:
     return {
-        idx: len(frames) / framerate
-        for idx, frames in interpolated_frames_map.items()
+        index: len(frames) / framerate
+        for index, frames in interpolated_frames_map.items()
         if frames
+    }
+
+
+def _write_seam_report(output_path: Path, seam_report) -> None:
+    report_path = output_path.with_name(f"{output_path.stem}.ummfiltered-seams.json")
+    payload = {
+        "median_score": seam_report.median_score,
+        "p95_score": seam_report.p95_score,
+        "entries": [
+            {
+                "seam_index": entry.seam_index,
+                "output_time": entry.output_time,
+                "chosen_strategy": entry.chosen_strategy,
+                "before_score": entry.before_score,
+                "after_score": entry.after_score,
+                "left_shift_ms": entry.left_shift_ms,
+                "right_shift_ms": entry.right_shift_ms,
+                "duration_ms": entry.duration_ms,
+                "accepted": entry.accepted,
+                "notes": entry.notes,
+                "repair_strategy": entry.repair_strategy,
+                "repair_text": entry.repair_text,
+                "repair_accepted": entry.repair_accepted,
+                "repair_notes": entry.repair_notes,
+            }
+            for entry in seam_report.entries
+        ],
+    }
+    report_path.write_text(json.dumps(payload, indent=2))
+
+
+def _render_with_audio(
+    input_path: Path,
+    output_path: Path,
+    segments: list[Segment],
+    metadata: VideoMetadata,
+    quality: str,
+    interpolated_frames_map: dict[int, list[np.ndarray]],
+    source_audio: np.ndarray,
+    native_sr: int,
+    room_tone: np.ndarray,
+    preserved_words: list | None = None,
+    contract_tokens: list[str] | None = None,
+    crossfade_overrides: dict[int, float] | None = None,
+    pause_overrides: dict[int, float] | None = None,
+    transition_durations: dict[int, float] | None = None,
+) -> None:
+    edit_plan = build_edit_decision_list(
+        segments,
+        pause_overrides=pause_overrides,
+        transition_durations=transition_durations,
+        preserved_words=preserved_words,
+        contract_tokens=contract_tokens,
+    )
+    render_video(
+        input_path,
+        output_path,
+        segments,
+        metadata,
+        quality,
+        interpolated_frames_map,
+        pause_ms=0,
+        crossfade_overrides=crossfade_overrides,
+        pause_overrides=pause_overrides,
+        edit_plan=edit_plan,
+    )
+    assembled_audio, seam_report = assemble_audio_track(
+        source_audio,
+        native_sr,
+        edit_plan,
+        room_tone,
+    )
+    replace_audio_track(output_path, assembled_audio, native_sr, metadata)
+    _write_seam_report(output_path, seam_report)
+
+
+def _result_meets_acceptance(result) -> bool:
+    filler_count = len(result.remaining_fillers) + len(result.new_fillers)
+    return (
+        filler_count == 0
+        and result.contract_intact
+        and not result.lost_words
+        and not result.damaged_words
+        and not result.audio_discontinuities
+    )
+
+
+def _transcript_regressed(candidate, reference) -> bool:
+    if reference is None:
+        return False
+    if reference.contract_intact and not candidate.contract_intact:
+        return True
+    if len(candidate.missing_tokens) > len(reference.missing_tokens):
+        return True
+    if candidate.preserved_word_recall + 1e-6 < reference.preserved_word_recall - 0.01:
+        return True
+    if candidate.max_missing_run > reference.max_missing_run + 1:
+        return True
+    if len(candidate.lost_words) > len(reference.lost_words):
+        return True
+    if len(candidate.damaged_words) > len(reference.damaged_words):
+        return True
+    return False
+
+
+def _is_better_result(candidate, reference) -> bool:
+    if reference is None:
+        return True
+    if _transcript_regressed(candidate, reference):
+        return False
+
+    candidate_fillers = len(candidate.remaining_fillers) + len(candidate.new_fillers)
+    reference_fillers = len(reference.remaining_fillers) + len(reference.new_fillers)
+    candidate_p95 = candidate.seam_report.p95_score if candidate.seam_report else float("inf")
+    reference_p95 = reference.seam_report.p95_score if reference.seam_report else float("inf")
+
+    if candidate_fillers < reference_fillers:
+        return True
+    if candidate_fillers > reference_fillers:
+        return False
+    if candidate.contract_intact and not reference.contract_intact:
+        return True
+    if len(candidate.missing_tokens) < len(reference.missing_tokens):
+        return True
+    if candidate.preserved_word_recall > reference.preserved_word_recall + 0.001:
+        return True
+    if candidate.max_missing_run < reference.max_missing_run:
+        return True
+    if candidate_p95 + SEAM_REGRESSION_MARGIN < reference_p95:
+        return True
+    return False
+
+
+def _status_message(result) -> str:
+    filler_count = len(result.remaining_fillers) + len(result.new_fillers)
+    seam_p95 = result.seam_report.p95_score if result.seam_report else 0.0
+    return (
+        f"{filler_count} fillers, recall {result.preserved_word_recall:.3f}, "
+        f"missing tokens {len(result.missing_tokens)}, "
+        f"max missing run {result.max_missing_run}, seam p95 {seam_p95:.3f}"
+    )
+
+
+def _should_try_no_pause_variant(
+    result,
+    pause_ms: float | None,
+    pause_overrides: dict[int, float] | None,
+) -> bool:
+    if pause_ms is not None:
+        return False
+    if not pause_overrides:
+        return False
+    if len(pause_overrides) < 5:
+        return False
+    filler_count = len(result.remaining_fillers) + len(result.new_fillers)
+    if filler_count > 0:
+        return True
+    return len(result.lost_words) >= 3
+
+
+def _result_stats(result: PipelineResult) -> dict[str, int | float | str | bool]:
+    return {
+        "outputPath": result.outputPath,
+        "removedFillers": result.removedFillers,
+        "removedSeconds": result.removedSeconds,
+        "finalStatus": result.finalStatus.value,
+        "warningCount": len(result.warnings),
     }
 
 
@@ -196,119 +528,264 @@ def run_pipeline(
     min_confidence: float = 0.15,
     pause_ms: float | None = None,
     no_refine: bool = False,
-) -> None:
-    metadata = probe_video(input_path)
+    reporter: ReporterLike | Callable[[PipelineEvent], None] | None = None,
+    cancel_token: CancellationToken | None = None,
+) -> PipelineResult:
+    warnings: list[str] = []
 
-    with _spinner("") as progress:
-        progress.add_task("  🎙️  [bold]Listening to audio...[/bold]", total=None)
+    try:
+        _check_cancel(cancel_token, PipelineStage.PROBE)
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_STARTED,
+            stage=PipelineStage.PROBE,
+            message="Inspecting source video...",
+        )
+        metadata = probe_video(input_path)
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_COMPLETED,
+            stage=PipelineStage.PROBE,
+            message="Inspecting source video...",
+            stats={"duration": metadata.duration},
+        )
+
+        _check_cancel(cancel_token, PipelineStage.EXTRACT_AUDIO)
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_STARTED,
+            stage=PipelineStage.EXTRACT_AUDIO,
+            message="Listening to audio...",
+        )
         samples, sample_rate = extract_audio_pcm(input_path)
-    console.print("  🎙️  [dim]Listening to audio...[/dim] [green]done[/green]")
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_COMPLETED,
+            stage=PipelineStage.EXTRACT_AUDIO,
+            message="Listening to audio...",
+            stats={"sampleRate": sample_rate},
+        )
 
-    with _spinner("") as progress:
-        progress.add_task("  🧠  [bold]Transcribing speech...[/bold]", total=None)
+        _check_cancel(cancel_token, PipelineStage.TRANSCRIBE)
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_STARTED,
+            stage=PipelineStage.TRANSCRIBE,
+            message="Transcribing speech...",
+        )
         words = transcribe(str(input_path), model_size=model_size, cloud=cloud)
-        native_samples, native_sr = extract_audio_pcm(input_path, sample_rate=metadata.audio_sample_rate)
-        room_tone = extract_room_tone(native_samples, native_sr, words=words)
-    console.print("  🧠  [dim]Transcribing speech...[/dim] [green]done[/green]")
+        source_audio, native_sr = extract_audio_matrix(
+            input_path,
+            sample_rate=metadata.audio_sample_rate,
+            channel_count=metadata.audio_channels,
+        )
+        room_tone = extract_room_tone(source_audio, native_sr, words=words)
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_COMPLETED,
+            stage=PipelineStage.TRANSCRIBE,
+            message="Transcribing speech...",
+            stats={"wordCount": len(words)},
+        )
 
-    with _spinner("") as progress:
-        progress.add_task("  🔍  [bold]Hunting for filler words...[/bold]", total=None)
+        _check_cancel(cancel_token, PipelineStage.DETECT_FILLERS)
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_STARTED,
+            stage=PipelineStage.DETECT_FILLERS,
+            message="Hunting for filler words...",
+        )
         fillers = detect_fillers(words, aggressive=aggressive, custom_fillers=custom_fillers)
         fillers = filter_fillers_by_context(fillers, words, min_confidence=min_confidence)
         fillers = expand_zero_duration_fillers(fillers, words)
-    console.print("  🔍  [dim]Hunting for filler words...[/dim] [green]done[/green]")
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_COMPLETED,
+            stage=PipelineStage.DETECT_FILLERS,
+            message="Hunting for filler words...",
+            stats={"fillerCount": len(fillers)},
+        )
 
-    _display_filler_bars(fillers)
+        if isinstance(reporter, RichPipelineReporter):
+            _display_filler_bars(fillers)
 
-    if not fillers:
-        console.print("  [green bold]✨ No filler words detected! Already clean.[/green bold]\n")
-        return
+        if not fillers:
+            result = PipelineResult(
+                outputPath=str(output_path),
+                removedFillers=0,
+                removedSeconds=0.0,
+                warnings=warnings,
+                finalStatus=PipelineFinalStatus.NO_FILLERS,
+            )
+            _emit(
+                reporter,
+                kind=PipelineEventKind.RESULT,
+                stage=PipelineStage.DETECT_FILLERS,
+                message="No filler words detected.",
+                stats=_result_stats(result),
+            )
+            return result
 
-    if interactive:
-        fillers = interactive_filter(fillers)
+        if interactive:
+            fillers = interactive_filter(fillers)
 
-    if dry_run:
-        console.print(f"  [yellow]Dry run:[/yellow] would remove [bold]{len(fillers)}[/bold] fillers")
-        return
+        if dry_run:
+            result = PipelineResult(
+                outputPath=str(output_path),
+                removedFillers=len(fillers),
+                removedSeconds=sum(f.end - f.start for f in fillers),
+                warnings=warnings,
+                finalStatus=PipelineFinalStatus.DRY_RUN,
+            )
+            _emit(
+                reporter,
+                kind=PipelineEventKind.RESULT,
+                stage=PipelineStage.DETECT_FILLERS,
+                message="Dry run complete.",
+                stats=_result_stats(result),
+            )
+            return result
 
-    with _spinner("") as progress:
-        progress.add_task("  ✂️  [bold]De-umming...[/bold]", total=None)
+        _check_cancel(cancel_token, PipelineStage.PLAN_CUTS)
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_STARTED,
+            stage=PipelineStage.PLAN_CUTS,
+            message="Planning cuts...",
+        )
         filler_ranges = {(f.start, f.end) for f in fillers}
         non_filler_words = [
-            w for w in words
-            if not any(fs <= w.start and w.end <= fe for fs, fe in filler_ranges)
+            word for word in words
+            if not any(fs <= word.start and word.end <= fe for fs, fe in filler_ranges)
         ]
+        contract_tokens = build_reference_contract(words, fillers)
         expanded_fillers: list[FillerSegment] = []
-        for f in fillers:
-            margin_start_s, margin_end_s = _filler_margin_seconds(f)
-            padded_start = max(0.0, f.start - margin_start_s)
-            padded_end = min(metadata.duration, f.end + margin_end_s)
+        for filler in fillers:
+            _check_cancel(cancel_token, PipelineStage.PLAN_CUTS)
+            margin_start_s, margin_end_s = _filler_margin_seconds(filler)
+            padded_start = max(0.0, filler.start - margin_start_s)
+            padded_end = min(metadata.duration, filler.end + margin_end_s)
             new_start, new_end = find_silence_boundaries(
-                samples, sample_rate, padded_start, padded_end,
+                samples,
+                sample_rate,
+                padded_start,
+                padded_end,
                 threshold_db=SILENCE_THRESHOLD_DB,
                 max_expansion_ms=MAX_EXPANSION_MS,
             )
             protected = protect_adjacent_words(
-                new_start, new_end, non_filler_words, samples, sample_rate,
+                new_start,
+                new_end,
+                non_filler_words,
+                samples,
+                sample_rate,
             )
             if protected is None:
                 continue
             new_start, new_end = protected
-            expanded_fillers.append(FillerSegment(
-                start=new_start, end=new_end,
-                word=f.word, confidence=f.confidence, source=f.source,
-            ))
+            expanded_fillers.append(
+                FillerSegment(
+                    start=new_start,
+                    end=new_end,
+                    word=filler.word,
+                    confidence=filler.confidence,
+                    source=filler.source,
+                )
+            )
+
         segments = build_keep_segments(expanded_fillers, metadata.duration, words=words)
-        pause_overrides = _build_pause_overrides(expanded_fillers) if pause_ms is None else None
-    console.print("  ✂️  [dim]De-umming...[/dim] [green]done[/green]")
+        effective_pause_ms = pause_ms
+        pause_overrides = _resolve_pause_overrides(expanded_fillers, effective_pause_ms)
+        segments, interpolated_frames_map = _classify_and_generate_transitions(
+            segments,
+            input_path,
+            metadata,
+            interpolator,
+            reporter=reporter,
+            warnings=warnings,
+            cancel_token=cancel_token,
+        )
+        transition_durations = _transition_durations(interpolated_frames_map, metadata.framerate)
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_COMPLETED,
+            stage=PipelineStage.PLAN_CUTS,
+            message="Planning cuts...",
+            stats={
+                "segmentCount": len(segments),
+                "removedFillers": len(expanded_fillers),
+            },
+        )
 
-    segments, interpolated_frames_map = _classify_and_generate_transitions(
-        segments, input_path, metadata, interpolator,
-    )
-    transition_durations = _transition_durations(interpolated_frames_map, metadata.framerate)
-
-    with _spinner("") as progress:
-        progress.add_task("  🧵  [bold]Stitching it all together...[/bold]", total=None)
-        render_video(
+        _check_cancel(cancel_token, PipelineStage.RENDER)
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_STARTED,
+            stage=PipelineStage.RENDER,
+            message="Stitching it all together...",
+        )
+        _render_with_audio(
             input_path,
             output_path,
             segments,
             metadata,
             quality,
             interpolated_frames_map,
-            pause_ms=pause_ms or 0,
-            pause_overrides=pause_overrides,
-        )
-        _smooth_audio_track(
-            output_path,
-            segments,
-            room_tone,
+            source_audio,
             native_sr,
-            metadata,
-            pause_overrides,
-            transition_durations,
+            room_tone,
+            preserved_words=non_filler_words,
+            contract_tokens=contract_tokens,
+            pause_overrides=pause_overrides,
+            transition_durations=transition_durations,
         )
-    console.print("  🧵  [dim]Stitching it all together...[/dim] [green]done[/green]")
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_COMPLETED,
+            stage=PipelineStage.RENDER,
+            message="Stitching it all together...",
+        )
 
-    final_fillers_for_summary = expanded_fillers
-    if not no_refine and not dry_run:
-        adjustments = {
-            i: CutAdjustment(filler=f, expansion_ms=MAX_EXPANSION_MS, crossfade_ms=CROSSFADE_MS)
-            for i, f in enumerate(expanded_fillers)
-        }
-        current_fillers = expanded_fillers
-        current_segments = segments
-        current_pause_overrides = pause_overrides
-        current_transition_durations = transition_durations
-        best_fillers = current_fillers
-        best_score: tuple[int, int, int, int] | None = None
-        best_output_path = Path(tempfile.NamedTemporaryFile(suffix=output_path.suffix, delete=False).name)
+        final_fillers_for_summary = expanded_fillers
+        if not no_refine:
+            _emit(
+                reporter,
+                kind=PipelineEventKind.STAGE_STARTED,
+                stage=PipelineStage.VERIFY,
+                message="Verifying output...",
+            )
+            adjustments = {
+                index: CutAdjustment(
+                    filler=filler,
+                    expansion_ms=MAX_EXPANSION_MS,
+                    crossfade_ms=CROSSFADE_MS,
+                )
+                for index, filler in enumerate(expanded_fillers)
+            }
+            current_fillers = expanded_fillers
+            current_segments = segments
+            current_pause_overrides = pause_overrides
+            current_effective_pause_ms = effective_pause_ms
+            current_transition_durations = transition_durations
+            best_fillers = current_fillers
+            best_result = None
+            best_output_path = Path(
+                tempfile.NamedTemporaryFile(suffix=output_path.suffix, delete=False).name
+            )
+            best_report_path = output_path.with_name(f"{output_path.stem}.ummfiltered-seams.json")
+            best_report_copy = Path(tempfile.NamedTemporaryFile(suffix=".json", delete=False).name)
 
-        try:
-            max_passes = 8
-            for pass_num in range(1, max_passes + 1):
-                with _spinner("") as progress:
-                    progress.add_task("  🔄  [bold]Verifying output...[/bold]", total=None)
+            try:
+                max_passes = 8
+                for pass_num in range(1, max_passes + 1):
+                    _check_cancel(cancel_token, PipelineStage.VERIFY)
+                    current_edit_plan = build_edit_decision_list(
+                        current_segments,
+                        pause_overrides=current_pause_overrides,
+                        transition_durations=current_transition_durations,
+                        preserved_words=non_filler_words,
+                        contract_tokens=contract_tokens,
+                    )
                     result = verify_output(
                         output_path,
                         words,
@@ -319,130 +796,335 @@ def run_pipeline(
                         min_confidence=min_confidence,
                         pause_overrides=current_pause_overrides,
                         transition_durations=current_transition_durations,
+                        edit_plan=current_edit_plan,
+                        reference_fillers=fillers,
                     )
 
-                score = _verification_score(result)
-                plateau_without_filler_issues = (
-                    best_score is not None
-                    and score == best_score
-                    and not result.remaining_fillers
-                    and not result.new_fillers
-                    and not result.lost_words
-                    and not result.damaged_words
-                )
-                if plateau_without_filler_issues:
-                    console.print("  🔄  [dim]Verifying output...[/dim] [green]stable plateau reached — keeping current cleanest render[/green]")
-                    final_fillers_for_summary = current_fillers
-                    break
+                    if pass_num == 1 and _should_try_no_pause_variant(
+                        result,
+                        current_effective_pause_ms,
+                        current_pause_overrides,
+                    ):
+                        alt_output_path = Path(
+                            tempfile.NamedTemporaryFile(suffix=output_path.suffix, delete=False).name
+                        )
+                        alt_report_path = alt_output_path.with_name(
+                            f"{alt_output_path.stem}.ummfiltered-seams.json"
+                        )
+                        try:
+                            alt_pause_overrides = None
+                            alt_edit_plan = build_edit_decision_list(
+                                current_segments,
+                                pause_overrides=alt_pause_overrides,
+                                transition_durations=current_transition_durations,
+                                preserved_words=non_filler_words,
+                                contract_tokens=contract_tokens,
+                            )
+                            _render_with_audio(
+                                input_path,
+                                alt_output_path,
+                                current_segments,
+                                metadata,
+                                quality,
+                                interpolated_frames_map,
+                                source_audio,
+                                native_sr,
+                                room_tone,
+                                preserved_words=non_filler_words,
+                                contract_tokens=contract_tokens,
+                                crossfade_overrides=None,
+                                pause_overrides=alt_pause_overrides,
+                                transition_durations=current_transition_durations,
+                            )
+                            alt_result = verify_output(
+                                alt_output_path,
+                                words,
+                                current_fillers,
+                                current_segments,
+                                model_size=model_size,
+                                aggressive=aggressive,
+                                min_confidence=min_confidence,
+                                pause_overrides=alt_pause_overrides,
+                                transition_durations=current_transition_durations,
+                                edit_plan=alt_edit_plan,
+                                reference_fillers=fillers,
+                            )
+                            if _is_better_result(alt_result, result):
+                                shutil.copy2(alt_output_path, output_path)
+                                if alt_report_path.exists():
+                                    shutil.copy2(alt_report_path, best_report_path)
+                                current_pause_overrides = alt_pause_overrides
+                                current_effective_pause_ms = 0.0
+                                current_edit_plan = alt_edit_plan
+                                result = alt_result
+                                _emit(
+                                    reporter,
+                                    kind=PipelineEventKind.INFO,
+                                    stage=PipelineStage.VERIFY,
+                                    message=(
+                                        "Adaptive pauses were hurting this file. "
+                                        "Retrying the current pass with no inserted pauses."
+                                    ),
+                                )
+                        finally:
+                            alt_output_path.unlink(missing_ok=True)
+                            alt_report_path.unlink(missing_ok=True)
 
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_fillers = current_fillers
-                    shutil.copy2(output_path, best_output_path)
-                elif score > best_score:
-                    console.print("  🔄  [dim]Verifying output...[/dim] [yellow]later pass got worse — keeping best earlier render[/yellow]")
-                    shutil.copy2(best_output_path, output_path)
-                    final_fillers_for_summary = best_fillers
-                    break
+                    if not _result_meets_acceptance(result) and output_path.exists():
+                        repair_backup_path = Path(
+                            tempfile.NamedTemporaryFile(suffix=output_path.suffix, delete=False).name
+                        )
+                        repair_backup_report = Path(
+                            tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+                        )
+                        try:
+                            shutil.copy2(output_path, repair_backup_path)
+                            if best_report_path.exists():
+                                shutil.copy2(best_report_path, repair_backup_report)
+                            repair_decisions = repair_output_audio(
+                                output_path=output_path,
+                                source_audio=source_audio,
+                                sample_rate=native_sr,
+                                metadata=metadata,
+                                edit_plan=current_edit_plan,
+                                verification=result,
+                            )
+                            if any(decision.accepted for decision in repair_decisions):
+                                repaired_result = verify_output(
+                                    output_path,
+                                    words,
+                                    current_fillers,
+                                    current_segments,
+                                    model_size=model_size,
+                                    aggressive=aggressive,
+                                    min_confidence=min_confidence,
+                                    pause_overrides=current_pause_overrides,
+                                    transition_durations=current_transition_durations,
+                                    edit_plan=current_edit_plan,
+                                    reference_fillers=fillers,
+                                )
+                                if repaired_result.seam_report is not None:
+                                    repaired_result.seam_report = merge_repair_decisions(
+                                        repaired_result.seam_report,
+                                        repair_decisions,
+                                    )
+                                    _write_seam_report(output_path, repaired_result.seam_report)
+                                if _is_better_result(repaired_result, result):
+                                    result = repaired_result
+                                    _emit(
+                                        reporter,
+                                        kind=PipelineEventKind.INFO,
+                                        stage=PipelineStage.VERIFY,
+                                        message=(
+                                            "Applied surgical seam repairs on the roughest cuts "
+                                            "and kept the improved version."
+                                        ),
+                                    )
+                                else:
+                                    shutil.copy2(repair_backup_path, output_path)
+                                    if repair_backup_report.exists():
+                                        shutil.copy2(repair_backup_report, best_report_path)
+                        finally:
+                            repair_backup_path.unlink(missing_ok=True)
+                            repair_backup_report.unlink(missing_ok=True)
 
-                if result.is_clean():
-                    console.print("  🔄  [dim]Verifying output...[/dim] [green]✅ clean[/green]")
-                    final_fillers_for_summary = current_fillers
-                    break
+                    if _is_better_result(result, best_result):
+                        best_result = result
+                        best_fillers = current_fillers
+                        shutil.copy2(output_path, best_output_path)
+                        if best_report_path.exists():
+                            shutil.copy2(best_report_path, best_report_copy)
+                    elif best_result is not None:
+                        _emit(
+                            reporter,
+                            kind=PipelineEventKind.INFO,
+                            stage=PipelineStage.VERIFY,
+                            message="A later refinement pass regressed. Restoring the best earlier render.",
+                        )
+                        shutil.copy2(best_output_path, output_path)
+                        if best_report_copy.exists():
+                            shutil.copy2(best_report_copy, best_report_path)
+                        final_fillers_for_summary = best_fillers
+                        break
 
-                console.print("  🔄  [dim]Verifying output...[/dim] [yellow]issues found[/yellow]")
-                if result.remaining_fillers:
-                    console.print(f"     [dim]{len(result.remaining_fillers)} fillers survived — widening cuts[/dim]")
-                if result.new_fillers:
-                    console.print(f"     [dim]{len(result.new_fillers)} new fillers found — adding cuts[/dim]")
-                if result.lost_words:
-                    console.print(f"     [dim]{len(result.lost_words)} words looked unsafe — narrowing cuts[/dim]")
-                if result.damaged_words:
-                    console.print(f"     [dim]{len(result.damaged_words)} clipped words — narrowing cuts[/dim]")
-                if result.audio_discontinuities:
-                    console.print(f"     [dim]{len(result.audio_discontinuities)} audio jumps — increasing fades[/dim]")
+                    if _result_meets_acceptance(result):
+                        _emit(
+                            reporter,
+                            kind=PipelineEventKind.INFO,
+                            stage=PipelineStage.VERIFY,
+                            message="Verification passed transcript and seam acceptance.",
+                        )
+                        final_fillers_for_summary = current_fillers
+                        break
 
-                if pass_num == max_passes:
-                    final_fillers_for_summary = best_fillers
-                    shutil.copy2(best_output_path, output_path)
-                    break
+                    _emit(
+                        reporter,
+                        kind=PipelineEventKind.INFO,
+                        stage=PipelineStage.VERIFY,
+                        message=(
+                            f"Refinement pass {pass_num} found issues and is rerendering "
+                            f"({_status_message(result)})."
+                        ),
+                        stats={
+                            "remainingFillers": len(result.remaining_fillers),
+                            "newFillers": len(result.new_fillers),
+                            "lostWords": len(result.lost_words),
+                            "damagedWords": len(result.damaged_words),
+                            "audioIssues": len(result.audio_discontinuities),
+                            "preservedRecall": result.preserved_word_recall,
+                            "maxMissingRun": result.max_missing_run,
+                            "seamP95": (
+                                result.seam_report.p95_score if result.seam_report else 0.0
+                            ),
+                        },
+                    )
 
-                apply_adjustments(
-                    adjustments,
-                    result,
-                    segments=current_segments,
-                    pause_overrides=current_pause_overrides,
-                    transition_durations=current_transition_durations,
-                )
-                current_fillers, crossfade_map = rebuild_cuts(
-                    adjustments,
-                    samples,
-                    sample_rate,
-                    non_filler_words=non_filler_words,
-                )
-                current_segments = build_keep_segments(current_fillers, metadata.duration, words=words)
-                current_pause_overrides = _build_pause_overrides(current_fillers) if pause_ms is None else None
-                current_segments, interpolated_frames_map = _classify_and_generate_transitions(
-                    current_segments,
-                    input_path,
-                    metadata,
-                    interpolator,
-                )
-                current_transition_durations = _transition_durations(interpolated_frames_map, metadata.framerate)
+                    if pass_num == max_passes:
+                        final_fillers_for_summary = best_fillers
+                        if best_result is not None:
+                            shutil.copy2(best_output_path, output_path)
+                            if best_report_copy.exists():
+                                shutil.copy2(best_report_copy, best_report_path)
+                        break
 
-                with _spinner("") as progress:
-                    progress.add_task("  🧵  [bold]Re-stitching from original...[/bold]", total=None)
-                    render_video(
+                    apply_adjustments(
+                        adjustments,
+                        result,
+                        segments=current_segments,
+                        pause_overrides=current_pause_overrides,
+                        transition_durations=current_transition_durations,
+                    )
+                    current_fillers, crossfade_map = rebuild_cuts(
+                        adjustments,
+                        samples,
+                        sample_rate,
+                        non_filler_words=non_filler_words,
+                    )
+                    current_segments = build_keep_segments(
+                        current_fillers,
+                        metadata.duration,
+                        words=words,
+                    )
+                    current_pause_overrides = (
+                        _resolve_pause_overrides(current_fillers, current_effective_pause_ms)
+                    )
+                    current_segments, interpolated_frames_map = _classify_and_generate_transitions(
+                        current_segments,
+                        input_path,
+                        metadata,
+                        interpolator,
+                        reporter=reporter,
+                        warnings=warnings,
+                        cancel_token=cancel_token,
+                    )
+                    current_transition_durations = _transition_durations(
+                        interpolated_frames_map,
+                        metadata.framerate,
+                    )
+
+                    _check_cancel(cancel_token, PipelineStage.RENDER)
+                    _render_with_audio(
                         input_path,
                         output_path,
                         current_segments,
                         metadata,
                         quality,
                         interpolated_frames_map,
-                        pause_ms=pause_ms or 0,
+                        source_audio,
+                        native_sr,
+                        room_tone,
+                        preserved_words=non_filler_words,
+                        contract_tokens=contract_tokens,
                         crossfade_overrides=crossfade_map,
                         pause_overrides=current_pause_overrides,
+                        transition_durations=current_transition_durations,
                     )
-                    _smooth_audio_track(
-                        output_path,
-                        current_segments,
-                        room_tone,
-                        native_sr,
-                        metadata,
-                        current_pause_overrides,
-                        current_transition_durations,
-                    )
-                console.print("  🧵  [dim]Re-stitching from original...[/dim] [green]done[/green]")
-                final_fillers_for_summary = current_fillers
-        finally:
-            best_output_path.unlink(missing_ok=True)
+                    final_fillers_for_summary = current_fillers
+            finally:
+                best_output_path.unlink(missing_ok=True)
+                best_report_copy.unlink(missing_ok=True)
 
-    if not dry_run:
-        with _spinner("") as progress:
-            progress.add_task("  🔍  [bold]Final quality check...[/bold]", total=None)
-            final_words = transcribe(str(output_path), model_size=model_size)
-            final_fillers = detect_fillers(final_words, aggressive=aggressive)
-            final_fillers = filter_fillers_by_context(final_fillers, final_words, min_confidence=min_confidence)
-            output_samples, output_sr = extract_audio_pcm(output_path)
-            real_fillers = []
-            for ff in final_fillers:
-                s = int(ff.start * output_sr)
-                e = int(ff.end * output_sr)
-                if s < len(output_samples) and e <= len(output_samples):
-                    energy = compute_rms_db(output_samples[s:e])
-                    if energy > -35:
-                        real_fillers.append((ff, energy))
-            final_fillers = [ff for ff, _ in real_fillers]
-        if final_fillers:
-            console.print(f"  🔍  [dim]Final quality check...[/dim] [yellow]{len(final_fillers)} fillers still detected[/yellow]")
-            for ff in final_fillers:
-                console.print(f"     [dim]\"{ff.word}\" at {ff.start:.1f}s (conf={ff.confidence:.2f})[/dim]")
+            _emit(
+                reporter,
+                kind=PipelineEventKind.STAGE_COMPLETED,
+                stage=PipelineStage.VERIFY,
+                message="Verifying output...",
+            )
         else:
-            console.print("  🔍  [dim]Final quality check...[/dim] [green]✅ no fillers detected[/green]")
+            _emit(
+                reporter,
+                kind=PipelineEventKind.STAGE_COMPLETED,
+                stage=PipelineStage.VERIFY,
+                message="Verification skipped.",
+                stats={"skipped": True},
+            )
 
-    total_removed = sum(f.end - f.start for f in final_fillers_for_summary)
-    console.print()
-    console.print(f"  [green bold]✨ {len(fillers)} filler words removed[/green bold]")
-    console.print(f"  [green bold]⏱️  {_format_duration(total_removed)} of dead air eliminated[/green bold]")
-    console.print(f"  [green bold]🔊 Audio gaps closed naturally[/green bold]")
-    console.print(f"\n  [bold]Saved to[/bold] {output_path}\n")
+        _check_cancel(cancel_token, PipelineStage.FINAL_CHECK)
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_STARTED,
+            stage=PipelineStage.FINAL_CHECK,
+            message="Running the final quality check...",
+        )
+        final_words = transcribe(str(output_path), model_size=model_size)
+        final_detected_fillers = detect_fillers(final_words, aggressive=aggressive)
+        final_detected_fillers = filter_fillers_by_context(
+            final_detected_fillers,
+            final_words,
+            min_confidence=min_confidence,
+        )
+        output_samples, output_sr = extract_audio_pcm(output_path)
+        confirmed_fillers: list[FillerSegment] = []
+        for filler in final_detected_fillers:
+            start = int(filler.start * output_sr)
+            end = int(filler.end * output_sr)
+            if start < len(output_samples) and end <= len(output_samples):
+                energy = compute_rms_db(output_samples[start:end])
+                if energy > -35:
+                    confirmed_fillers.append(filler)
+        if confirmed_fillers:
+            _warning(
+                warnings,
+                reporter,
+                PipelineStage.FINAL_CHECK,
+                f"{len(confirmed_fillers)} fillers were still detected in the final output.",
+            )
+        _emit(
+            reporter,
+            kind=PipelineEventKind.STAGE_COMPLETED,
+            stage=PipelineStage.FINAL_CHECK,
+            message="Running the final quality check...",
+            stats={"remainingFillers": len(confirmed_fillers)},
+        )
+
+        pipeline_result = PipelineResult(
+            outputPath=str(output_path),
+            removedFillers=len(final_fillers_for_summary),
+            removedSeconds=sum(f.end - f.start for f in final_fillers_for_summary),
+            warnings=warnings,
+            finalStatus=PipelineFinalStatus.SUCCESS,
+        )
+        _emit(
+            reporter,
+            kind=PipelineEventKind.RESULT,
+            stage=PipelineStage.FINAL_CHECK,
+            message="Processing complete.",
+            stats=_result_stats(pipeline_result),
+        )
+        return pipeline_result
+    except PipelineCancelledError as exc:
+        result = PipelineResult(
+            outputPath=str(output_path),
+            removedFillers=0,
+            removedSeconds=0.0,
+            warnings=warnings,
+            finalStatus=PipelineFinalStatus.CANCELLED,
+        )
+        _emit(
+            reporter,
+            kind=PipelineEventKind.CANCELLED,
+            stage=None,
+            message=str(exc),
+            stats=_result_stats(result),
+        )
+        return result

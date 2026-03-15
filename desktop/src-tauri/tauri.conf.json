@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "UmmFiltered",
+  "version": "0.1.0",
+  "identifier": "com.ummfiltered.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "UmmFiltered",
+        "width": 680,
+        "height": 740,
+        "minWidth": 640,
+        "minHeight": 700,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "titleBarStyle": "transparent",
+        "hiddenTitle": true,
+        "theme": "Dark",
+        "backgroundColor": "#4b4e53"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

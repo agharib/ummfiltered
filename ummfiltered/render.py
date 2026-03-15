@@ -2,20 +2,22 @@ import json
 import subprocess
 import tempfile
 from pathlib import Path
+import wave
 
 import numpy as np
 from PIL import Image
 
 from ummfiltered.config import CROSSFADE_MS, PADDING_MS
-from ummfiltered.models import Segment, TransitionType, VideoMetadata
+from ummfiltered.ffmpeg_tools import ffmpeg_cmd, ffprobe_cmd
+from ummfiltered.models import EditDecisionList, Segment, TransitionType, VideoMetadata
 
 
 def probe_video(video_path: Path) -> VideoMetadata:
     result = subprocess.run(
-        [
-            "ffprobe", "-v", "quiet", "-print_format", "json",
-            "-show_format", "-show_streams", str(video_path),
-        ],
+        ffprobe_cmd(
+            "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", video_path,
+        ),
         capture_output=True,
         text=True,
         check=True,
@@ -46,10 +48,10 @@ def probe_video(video_path: Path) -> VideoMetadata:
 def get_frame_at_time(video_path: Path, time_s: float, width: int, height: int) -> np.ndarray:
     time_s = max(0.0, time_s)
     result = subprocess.run(
-        [
-            "ffmpeg", "-ss", str(time_s), "-i", str(video_path),
+        ffmpeg_cmd(
+            "-ss", time_s, "-i", video_path,
             "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
-        ],
+        ),
         capture_output=True,
         check=True,
     )
@@ -112,43 +114,27 @@ def _extract_segments(
         seg_files.append((i, seg_path))
 
         vf_filters = []
-        af_filters = []
-
-        seg_crossfade = crossfade_overrides.get(i, crossfade_s) if crossfade_overrides else crossfade_s
-        af_filters.append(f"afade=t=in:d={seg_crossfade}")
-        af_filters.append(f"afade=t=out:st={max(0, duration - seg_crossfade):.4f}:d={seg_crossfade}")
 
         seg_pause_s = pause_overrides.get(i, pause_s) if pause_overrides else pause_s
         if seg_pause_s > 0 and i < len(padded) - 1:
             vf_filters.append(f"tpad=stop_duration={seg_pause_s}:stop_mode=clone")
-            af_filters.append(f"apad=pad_dur={seg_pause_s}")
 
         video_filter = ",".join([
             f"trim=start={seg.start:.4f}:duration={duration:.4f}",
             "setpts=PTS-STARTPTS",
             *vf_filters,
         ])
-        audio_filter = ",".join([
-            f"atrim=start={seg.start:.4f}:duration={duration:.4f}",
-            "asetpts=PTS-STARTPTS",
-            *af_filters,
-        ])
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_path),
-            "-filter_complex",
-            f"[0:v]{video_filter}[v];[0:a]{audio_filter}[a]",
-            "-map", "[v]",
-            "-map", "[a]",
+        cmd = ffmpeg_cmd(
+            "-y",
+            "-i", input_path,
+            "-filter:v", video_filter,
+            "-an",
             "-c:v", "libx264", "-preset", "fast",
-            "-c:a", "aac",
-            "-ar", str(metadata.audio_sample_rate),
-            "-ac", str(metadata.audio_channels),
             "-pix_fmt", metadata.pixel_format,
             "-r", str(metadata.framerate),
-        ]
-        cmd.append(str(seg_path))
+            seg_path,
+        )
         subprocess.run(cmd, capture_output=True, check=True)
     return seg_files
 
@@ -159,22 +145,14 @@ def _render_concat(seg_files: list[Path], output_path: Path, metadata: VideoMeta
         for seg_path in seg_files:
             f.write(f"file '{seg_path}'\n")
 
-    cmd = [
-        "ffmpeg", "-y",
+    cmd = ffmpeg_cmd(
+        "-y",
         "-f", "concat", "-safe", "0",
-        "-i", str(concat_list),
-    ]
-    _add_encoding_args(cmd, metadata, quality)
+        "-i", concat_list,
+    )
+    _add_encoding_args(cmd, metadata, quality, include_audio=False)
     cmd.append(str(output_path))
     subprocess.run(cmd, capture_output=True, check=True)
-
-
-def _audio_channel_layout(audio_channels: int) -> str:
-    if audio_channels == 1:
-        return "mono"
-    if audio_channels == 2:
-        return "stereo"
-    return "stereo"
 
 
 def _render_interpolation_clip(
@@ -191,21 +169,17 @@ def _render_interpolation_clip(
 
     clip_path = Path(tmpdir) / f"interp_{clip_idx:04d}.mp4"
     duration_s = len(frames) / metadata.framerate
-    cmd = [
-        "ffmpeg", "-y",
-        "-framerate", str(metadata.framerate),
-        "-i", str(frame_dir / "%04d.png"),
-        "-f", "lavfi",
-        "-i", f"anullsrc=r={metadata.audio_sample_rate}:cl={_audio_channel_layout(metadata.audio_channels)}",
-        "-t", f"{duration_s:.4f}",
+    cmd = ffmpeg_cmd(
+        "-y",
+        "-framerate", metadata.framerate,
+        "-i", frame_dir / "%04d.png",
         "-c:v", "libx264", "-preset", "fast",
-        "-c:a", "aac",
-        "-ar", str(metadata.audio_sample_rate),
-        "-ac", str(metadata.audio_channels),
         "-pix_fmt", metadata.pixel_format,
         "-r", str(metadata.framerate),
-        str(clip_path),
-    ]
+        "-t", f"{duration_s:.4f}",
+        "-an",
+        clip_path,
+    )
     subprocess.run(cmd, capture_output=True, check=True)
     return clip_path
 
@@ -220,17 +194,23 @@ def render_video(
     pause_ms: float = 0,
     crossfade_overrides: dict[int, float] | None = None,
     pause_overrides: dict[int, float] | None = None,
+    edit_plan: EditDecisionList | None = None,
 ) -> None:
-    if len(segments) <= 1:
-        vf, af = build_segment_filter(segments)
-        cmd = [
-            "ffmpeg", "-y", "-i", str(input_path),
-            "-vf", vf, "-af", af,
+    if edit_plan is not None:
+        segments = [
+            Segment(
+                start=decision.source_start,
+                end=decision.source_end,
+                transition_type=decision.transition_type,
+                visual_gap_score=1.0,
+            )
+            for decision in edit_plan.decisions
         ]
-        _add_encoding_args(cmd, metadata, quality)
-        cmd.append(str(output_path))
-        subprocess.run(cmd, capture_output=True, check=True)
-        return
+        pause_overrides = {
+            decision.index: decision.pause_after
+            for decision in edit_plan.decisions
+            if decision.pause_after > 0
+        } or None
 
     padded = add_padding(segments, metadata.duration)
     crossfade_s = CROSSFADE_MS / 1000.0
@@ -258,16 +238,19 @@ def replace_audio_track(
     sample_rate: int,
     metadata: VideoMetadata,
 ) -> None:
-    import wave
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         wav_path = f.name
 
-    channel_count = max(1, metadata.audio_channels)
-    mono_audio = np.clip(audio_samples, -1.0, 1.0)
-    if channel_count == 1:
-        audio_matrix = mono_audio[:, None]
+    clipped_audio = np.clip(audio_samples, -1.0, 1.0)
+    if clipped_audio.ndim == 1:
+        channel_count = max(1, metadata.audio_channels)
+        if channel_count == 1:
+            audio_matrix = clipped_audio[:, None]
+        else:
+            audio_matrix = np.repeat(clipped_audio[:, None], channel_count, axis=1)
     else:
-        audio_matrix = np.repeat(mono_audio[:, None], channel_count, axis=1)
+        audio_matrix = clipped_audio
+        channel_count = audio_matrix.shape[1]
 
     audio_int16 = (audio_matrix * 32767).astype(np.int16)
     with wave.open(wav_path, "wb") as wf:
@@ -278,17 +261,17 @@ def replace_audio_track(
 
     tmp_output = str(video_path) + ".tmp.mp4"
     subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(video_path), "-i", wav_path,
+        ffmpeg_cmd(
+            "-y",
+            "-i", video_path, "-i", wav_path,
             "-c:v", "copy", "-c:a", "aac",
-            "-ar", str(metadata.audio_sample_rate),
-            "-ac", str(metadata.audio_channels),
-            "-b:a", str(metadata.audio_bitrate),
-            "-map", "0:v", "-map", "1:a",
+            "-ar", metadata.audio_sample_rate,
+            "-ac", channel_count,
+            "-b:a", metadata.audio_bitrate,
+            "-map", "0:v:0", "-map", "1:a:0",
             "-shortest",
             tmp_output,
-        ],
+        ),
         capture_output=True,
         check=True,
     )
@@ -297,7 +280,7 @@ def replace_audio_track(
     Path(tmp_output).replace(video_path)
 
 
-def _add_encoding_args(cmd: list[str], metadata: VideoMetadata, quality: str) -> None:
+def _add_encoding_args(cmd: list[str], metadata: VideoMetadata, quality: str, include_audio: bool = True) -> None:
     if quality == "matched" and metadata.bitrate > 0:
         cmd.extend(["-b:v", str(metadata.bitrate)])
     elif quality == "matched":
@@ -308,8 +291,11 @@ def _add_encoding_args(cmd: list[str], metadata: VideoMetadata, quality: str) ->
         "-preset", "medium",
         "-pix_fmt", metadata.pixel_format,
         "-r", str(metadata.framerate),
-        "-c:a", "aac",
-        "-b:a", str(metadata.audio_bitrate),
-        "-ar", str(metadata.audio_sample_rate),
-        "-ac", str(metadata.audio_channels),
     ])
+    if include_audio:
+        cmd.extend([
+            "-c:a", "aac",
+            "-b:a", str(metadata.audio_bitrate),
+            "-ar", str(metadata.audio_sample_rate),
+            "-ac", str(metadata.audio_channels),
+        ])

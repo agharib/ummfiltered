@@ -52,6 +52,8 @@ class EditDecision:
     output_start: float
     output_end: float
     transition_type: TransitionType
+    lead_padding: float = 0.0
+    trail_padding: float = 0.0
     pause_after: float = 0.0
     transition_duration_after: float = 0.0
     removed_gap_after: RemovedGap | None = None
@@ -65,6 +67,7 @@ class EditDecision:
 class EditDecisionList:
     decisions: list[EditDecision]
     total_output_duration: float
+    contract_tokens: list[str] = field(default_factory=list)
 
     def cut_points(self) -> list[float]:
         return [decision.output_end for decision in self.decisions[:-1]]
@@ -103,6 +106,21 @@ class VerificationResult:
     preserved_word_recall: float = 1.0
     max_missing_run: int = 0
     seam_report: "SeamReport | None" = None
+    missing_words: list[Word] = field(default_factory=list)
+    output_words: list[Word] = field(default_factory=list)
+    contract_tokens: list[str] = field(default_factory=list)
+    missing_tokens: list[str] = field(default_factory=list)
+    contract_intact: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.contract_intact is None:
+            self.contract_intact = (
+                not self.missing_tokens
+                and not self.missing_words
+                and not self.lost_words
+                and not self.damaged_words
+                and self.max_missing_run == 0
+            )
 
     def is_clean(self) -> bool:
         return not any([
@@ -141,6 +159,10 @@ class SeamReportEntry:
     duration_ms: float
     accepted: bool
     notes: str = ""
+    repair_strategy: str | None = None
+    repair_text: str | None = None
+    repair_accepted: bool = False
+    repair_notes: str = ""
 
 
 @dataclass
@@ -168,3 +190,102 @@ class SeamReport:
         ordered = sorted(self.scores)
         idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * 0.95))))
         return ordered[idx]
+
+
+@dataclass
+class RepairCandidate:
+    seam_index: int
+    strategy: str
+    repair_text: str
+    window_start: float
+    window_end: float
+    before_score: float
+    after_score: float
+    accepted: bool
+    notes: str = ""
+
+
+@dataclass
+class RepairDecision:
+    seam_index: int
+    strategy: str
+    repair_text: str
+    window_start: float
+    window_end: float
+    before_score: float
+    after_score: float
+    accepted: bool
+    notes: str = ""
+
+
+class PipelineStage(str, Enum):
+    PROBE = "probe"
+    EXTRACT_AUDIO = "extract_audio"
+    TRANSCRIBE = "transcribe"
+    DETECT_FILLERS = "detect_fillers"
+    PLAN_CUTS = "plan_cuts"
+    RENDER = "render"
+    VERIFY = "verify"
+    FINAL_CHECK = "final_check"
+
+
+class PipelineEventKind(str, Enum):
+    STAGE_STARTED = "stage_started"
+    STAGE_COMPLETED = "stage_completed"
+    INFO = "info"
+    WARNING = "warning"
+    RESULT = "result"
+    ERROR = "error"
+    CANCELLED = "cancelled"
+
+
+class PipelineFinalStatus(str, Enum):
+    SUCCESS = "success"
+    NO_FILLERS = "no_fillers"
+    DRY_RUN = "dry_run"
+    CANCELLED = "cancelled"
+    ERROR = "error"
+
+
+@dataclass
+class PipelineEvent:
+    kind: PipelineEventKind
+    stage: PipelineStage | None
+    message: str
+    warning: str | None = None
+    stats: dict[str, int | float | str | bool] | None = None
+
+
+@dataclass
+class PipelineResult:
+    outputPath: str
+    removedFillers: int
+    removedSeconds: float
+    warnings: list[str] = field(default_factory=list)
+    finalStatus: PipelineFinalStatus = PipelineFinalStatus.SUCCESS
+
+
+class GuiPreset(str, Enum):
+    SPEED = "speed"
+    BALANCED = "balanced"
+    QUALITY = "quality"
+
+
+@dataclass
+class GuiOverrides:
+    modelSize: str | None = None
+    quality: str | None = None
+    minConfidence: float | None = None
+    customFillers: list[str] | None = None
+    fixedPauseMs: float | None = None
+
+
+@dataclass
+class GuiProcessRequest:
+    inputPath: str
+    outputPath: str | None
+    preset: GuiPreset
+    aggressive: bool
+    verifyPass: bool
+    naturalPauses: bool
+    overrides: GuiOverrides = field(default_factory=GuiOverrides)

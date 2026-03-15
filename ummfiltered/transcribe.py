@@ -1,5 +1,8 @@
+import importlib
 import string
 from pathlib import Path
+import subprocess
+import sys
 
 try:
     from faster_whisper import WhisperModel
@@ -26,11 +29,37 @@ def build_whisper_params(model_size: str) -> dict:
     }
 
 
-def transcribe_local(audio_path: str | Path, model_size: str = "large") -> list[Word]:
-    if WhisperModel is None:
-        raise ImportError("faster-whisper is required for local transcription")
+def _install_python_dependency(requirement: str) -> None:
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", requirement],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
 
-    model = WhisperModel(model_size, device="auto", compute_type="auto")
+
+def _ensure_whisper_model():
+    global WhisperModel
+    if WhisperModel is not None:
+        return WhisperModel
+    _install_python_dependency("faster-whisper>=1.0.0")
+    WhisperModel = importlib.import_module("faster_whisper").WhisperModel
+    return WhisperModel
+
+
+def _load_deepgram_sdk():
+    try:
+        module = importlib.import_module("deepgram")
+    except ImportError:
+        _install_python_dependency("deepgram-sdk>=3.0.0")
+        module = importlib.import_module("deepgram")
+    return module.DeepgramClient, module.PrerecordedOptions
+
+
+def transcribe_local(audio_path: str | Path, model_size: str = "large") -> list[Word]:
+    whisper_model_cls = _ensure_whisper_model()
+
+    model = whisper_model_cls(model_size, device="auto", compute_type="auto")
     params = build_whisper_params(model_size)
 
     segments, _info = model.transcribe(str(audio_path), **params)
@@ -50,7 +79,7 @@ def transcribe_local(audio_path: str | Path, model_size: str = "large") -> list[
 
 
 def transcribe_cloud_deepgram(audio_path: str | Path) -> list[Word]:
-    from deepgram import DeepgramClient, PrerecordedOptions
+    DeepgramClient, PrerecordedOptions = _load_deepgram_sdk()
 
     client = DeepgramClient()
     with open(audio_path, "rb") as f:

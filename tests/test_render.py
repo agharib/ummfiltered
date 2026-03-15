@@ -7,7 +7,7 @@ import wave
 import numpy as np
 import pytest
 
-from ummfiltered.audio import compute_rms_db, extract_audio_pcm
+from ummfiltered.audio import extract_audio_pcm
 from ummfiltered.ffmpeg_tools import ensure_ffmpeg_tools
 from ummfiltered.render import _extract_segments, add_padding, build_segment_filter, render_video, replace_audio_track
 from ummfiltered.models import Segment, TransitionType, VideoMetadata
@@ -131,14 +131,13 @@ class TestExtractSegments:
 
         assert seen_commands
         first_cmd = seen_commands[0]
-        assert "-filter_complex" in first_cmd
-        filter_graph = first_cmd[first_cmd.index("-filter_complex") + 1]
+        assert "-filter:v" in first_cmd
+        filter_graph = first_cmd[first_cmd.index("-filter:v") + 1]
         assert "trim=start=1.2500:duration=0.7500" in filter_graph
-        assert "atrim=start=1.2500:duration=0.7500" in filter_graph
-        assert "-map" in first_cmd
+        assert "-an" in first_cmd
 
     @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg/ffprobe not installed")
-    def test_preserves_audio_for_later_segments(self, tmp_path: Path):
+    def test_renders_video_only_segments_for_separate_audio_pipeline(self, tmp_path: Path):
         ensure_ffmpeg_tools()
         input_path = tmp_path / "sample.mp4"
         subprocess.run(
@@ -179,8 +178,16 @@ class TestExtractSegments:
         )
 
         later_path = seg_files[1][1]
-        samples, sr = extract_audio_pcm(later_path)
-        assert compute_rms_db(samples) > -60
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_streams", str(later_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert '"codec_type": "audio"' not in probe.stdout
 
 
 class TestReplaceAudioTrack:

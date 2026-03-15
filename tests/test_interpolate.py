@@ -1,6 +1,6 @@
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import numpy as np
 from ummfiltered.interpolate import save_frame_png, build_ncnn_command
@@ -8,14 +8,17 @@ from ummfiltered.interpolate import save_frame_png, build_ncnn_command
 
 class TestBuildNcnnCommand:
     def test_command_structure(self):
-        cmd = build_ncnn_command(
-            input_dir="/tmp/in",
-            output_dir="/tmp/out",
-            num_frames=3,
-        )
+        with patch("ummfiltered.interpolate.ensure_interpolator_backend", return_value="/tmp/bin/rife-ncnn-vulkan"):
+            cmd = build_ncnn_command(
+                input_dir="/tmp/in",
+                output_dir="/tmp/out",
+                num_frames=3,
+            )
         assert "rife-ncnn-vulkan" in cmd[0]
         assert "/tmp/in" in cmd
         assert "/tmp/out" in cmd
+        assert "-m" in cmd
+        assert "rife-v4" in cmd
 
 
 class TestSaveFramePng:

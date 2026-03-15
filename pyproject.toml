@@ -22,3 +22,4 @@ dev = ["pytest>=7.0.0", "pytest-mock>=3.0.0"]
 
 [project.scripts]
 ummfiltered = "ummfiltered.cli:main"
+ummfiltered-gui-worker = "ummfiltered.gui_worker:main"
